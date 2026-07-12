@@ -167,7 +167,12 @@ impl<W: Write> Monitor<W> {
 
     match &action {
       Actions::Message { msg, raw_msg, .. } => {
-        self.write_log(raw_msg.as_deref().unwrap_or(msg.as_str()))?;
+        let line = if self.config.use_color {
+          msg.as_str()
+        } else {
+          raw_msg.as_deref().unwrap_or(msg.as_str())
+        };
+        self.write_log(line)?;
       },
       Actions::Result {
         fields,
@@ -250,10 +255,10 @@ impl<W: Write> Monitor<W> {
       return Ok(self.start_human_build(trimmed));
     }
 
-    if trimmed.starts_with("builder for '")
-      && trimmed.contains("failed with exit code")
-      && let Some(drv) = extract_derivation(trimmed)
-    {
+    let reports_build_failure = (trimmed.contains("builder for '")
+      && trimmed.contains("failed"))
+      || trimmed.contains("Cannot build '");
+    if reports_build_failure && let Some(drv) = extract_derivation(trimmed) {
       let id = self.state.get_or_create_derivation_id(drv);
       let now = current_time();
       let info = current_build_info(&self.state, id).unwrap_or(BuildInfo {

@@ -65,7 +65,7 @@ fn human_plan_and_build_are_preserved_and_rendered() {
 #[test]
 fn final_graph_precedes_build_failed_result() {
   let input = format!(
-    "building '{DRV}'...\nbuilder for '{DRV}' failed with exit code 1\n"
+    "building '{DRV}'...\nerror: builder for '{DRV}' failed with exit code 1\n"
   );
   let mut monitor = create_monitor(Config::default(), Vec::new()).unwrap();
   let result = monitor.process_stream(Cursor::new(input));
