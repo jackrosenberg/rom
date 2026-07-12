@@ -22,7 +22,6 @@ pub(super) use rom_core::{
     Attribute,
     Color,
     Screen,
-    Style,
     TuiConfig,
     render_final_graph_screen,
     render_graph_screen,
@@ -30,24 +29,24 @@ pub(super) use rom_core::{
 };
 
 pub(super) const GRAPH_LINE_COLOR: Color = Color::Rgb {
-  r: 47,
-  g: 104,
-  b: 126,
+  r: 75,
+  g: 88,
+  b: 112,
 };
 pub(super) const MOSS_GREEN: Color = Color::Rgb {
-  r: 63,
-  g: 236,
-  b: 208,
+  r: 109,
+  g: 145,
+  b: 229,
 };
 pub(super) const MUTED_RED: Color = Color::Rgb {
-  r: 234,
-  g: 65,
-  b: 83,
+  r: 224,
+  g: 111,
+  b: 114,
 };
 pub(super) const MUTED_YELLOW: Color = Color::Rgb {
-  r: 255,
-  g: 179,
-  b: 76,
+  r: 215,
+  g: 155,
+  b: 91,
 };
 
 pub(super) struct TestBackend {

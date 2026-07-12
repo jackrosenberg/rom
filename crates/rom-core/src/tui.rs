@@ -25,45 +25,55 @@ use crate::{
   state::{RenderSnapshot, State, current_time},
 };
 
+const TEXT_PRIMARY: Color = Color::Rgb {
+  r: 231,
+  g: 236,
+  b: 248,
+};
 const TEXT_MUTED: Color = Color::Rgb {
-  r: 122,
-  g: 164,
-  b: 179,
+  r: 135,
+  g: 148,
+  b: 173,
 };
 const GRAPH_LINE_COLOR: Color = Color::Rgb {
-  r: 47,
-  g: 104,
-  b: 126,
+  r: 75,
+  g: 88,
+  b: 112,
+};
+const TABLE_HEADER_COLOR: Color = Color::Rgb {
+  r: 174,
+  g: 187,
+  b: 221,
 };
 const MOSS_GREEN: Color = Color::Rgb {
-  r: 63,
-  g: 236,
-  b: 208,
+  r: 109,
+  g: 145,
+  b: 229,
 };
 const BUILT_GREEN: Color = Color::Rgb {
-  r: 74,
-  g: 158,
-  b: 139,
+  r: 119,
+  g: 190,
+  b: 146,
 };
 const DOWNLOAD_BLUE: Color = Color::Rgb {
-  r: 73,
-  g: 147,
-  b: 255,
+  r: 85,
+  g: 180,
+  b: 204,
 };
 const UPLOAD_PURPLE: Color = Color::Rgb {
-  r: 193,
-  g: 96,
-  b: 232,
+  r: 169,
+  g: 138,
+  b: 221,
 };
 const MUTED_RED: Color = Color::Rgb {
-  r: 234,
-  g: 65,
-  b: 83,
+  r: 224,
+  g: 111,
+  b: 114,
 };
 const MUTED_YELLOW: Color = Color::Rgb {
-  r: 255,
-  g: 179,
-  b: 76,
+  r: 215,
+  g: 155,
+  b: 91,
 };
 const SPINNER_FRAMES: &[&str] = &["⢄", "⢂", "⢁", "⡁", "⡈", "⡐", "⡠"];
 #[derive(Clone, Copy, Default)]
@@ -256,15 +266,27 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
       "┐",
     ));
     for host in hosts {
-      let pull = pulls
-        .get(&host)
+      let pull_activity = pulls.get(&host);
+      let push_activity = pushes.get(&host);
+      let pull = pull_activity
         .map(|activity| transfer_cell(activity, columns.detail))
         .unwrap_or_else(|| "—".to_string());
-      let push = pushes
-        .get(&host)
+      let push = push_activity
         .map(|activity| transfer_cell(activity, columns.detail))
         .unwrap_or_else(|| "—".to_string());
-      lines.push(table_row(&[host, pull, push], &columns.host_widths));
+      lines.push(table_row(&[host, pull, push], &columns.host_widths, &[
+        Style::default().fg(TEXT_PRIMARY),
+        Style::default().fg(if pull_activity.is_some() {
+          DOWNLOAD_BLUE
+        } else {
+          TEXT_MUTED
+        }),
+        Style::default().fg(if push_activity.is_some() {
+          UPLOAD_PURPLE
+        } else {
+          TEXT_MUTED
+        }),
+      ]));
     }
   }
 
@@ -290,6 +312,13 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
       summary.failed_builds.len().to_string(),
     ],
     &columns.build_widths,
+    &[
+      Style::default().fg(TEXT_PRIMARY),
+      Style::default().fg(MOSS_GREEN),
+      Style::default().fg(MUTED_YELLOW),
+      Style::default().fg(BUILT_GREEN),
+      Style::default().fg(MUTED_RED),
+    ],
   ));
   lines.push(table_bottom(
     width,
@@ -397,7 +426,12 @@ fn compact_footer_line(state: &RenderSnapshot, width: usize) -> Line {
   let content_width = width.saturating_sub(2 + display_width(&notch));
   let content = fit_text(&status, content_width);
   let rule = "─".repeat(content_width.saturating_sub(display_width(&content)));
-  Line::from(format!("└─{content}{rule}{notch}"))
+  Line::from(vec![
+    Span::styled("└─", hierarchy_style()),
+    Span::styled(content, Style::default().fg(TEXT_PRIMARY)),
+    Span::styled(rule, hierarchy_style()),
+    Span::styled(notch, secondary_style()),
+  ])
 }
 
 fn table_header(
@@ -406,32 +440,41 @@ fn table_header(
   widths: &[usize],
   right: &str,
 ) -> Line {
-  let mut spans = vec![Span::raw(left)];
+  let mut spans = vec![Span::styled(left, hierarchy_style())];
   for (index, (title, width)) in titles.iter().zip(widths).enumerate() {
     let label = fit_text(&format!(" {title} "), *width);
-    spans.push(Span::raw("─"));
-    spans.push(Span::raw(label.clone()));
-    spans.push(Span::raw(
-      "─".repeat(width.saturating_sub(display_width(&label))),
+    spans.push(Span::styled("─", hierarchy_style()));
+    spans.push(Span::styled(
+      label.clone(),
+      Style::default()
+        .fg(TABLE_HEADER_COLOR)
+        .add_attribute(Attribute::Bold),
     ));
-    spans.push(Span::raw(if index + 1 == titles.len() {
-      right
-    } else {
-      "┬"
-    }));
+    spans.push(Span::styled(
+      "─".repeat(width.saturating_sub(display_width(&label))),
+      hierarchy_style(),
+    ));
+    spans.push(Span::styled(
+      if index + 1 == titles.len() {
+        right
+      } else {
+        "┬"
+      },
+      hierarchy_style(),
+    ));
   }
   Line::from(spans)
 }
 
-fn table_row(values: &[String], widths: &[usize]) -> Line {
-  let mut spans = vec![Span::raw("│")];
-  for (value, width) in values.iter().zip(widths) {
+fn table_row(values: &[String], widths: &[usize], styles: &[Style]) -> Line {
+  let mut spans = vec![Span::styled("│", hierarchy_style())];
+  for ((value, width), style) in values.iter().zip(widths).zip(styles) {
     let value = fit_text(value, *width);
     let padding = width.saturating_sub(display_width(&value));
     spans.push(Span::raw(" "));
-    spans.push(Span::raw(value));
+    spans.push(Span::styled(value, *style));
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::raw("│"));
+    spans.push(Span::styled("│", hierarchy_style()));
   }
   Line::from(spans)
 }
@@ -447,7 +490,10 @@ fn table_bottom(width: usize, elapsed: &str, columns: &[usize]) -> Line {
     }
   }
   rule = fit_rule(&rule, rule_width);
-  Line::from(format!("└{rule}{notch}"))
+  Line::from(vec![
+    Span::styled(format!("└{rule}"), hierarchy_style()),
+    Span::styled(notch, secondary_style()),
+  ])
 }
 
 fn fit_rule(rule: &str, width: usize) -> String {

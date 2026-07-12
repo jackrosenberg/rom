@@ -26,14 +26,57 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
   assert!(bottom_border.starts_with('└'), "{bottom_border:?}");
   assert!(bottom_border.contains('┴'), "{bottom_border:?}");
   assert!(bottom_border.contains("┤ ") && bottom_border.ends_with(" ┘"));
-  for y in 1..screen.height() {
-    for cell in screen.row(y).unwrap() {
-      assert_eq!(
-        cell.style,
-        Style::default(),
-        "colored table cell at row {y}"
-      );
-    }
+  let header_cells = screen.row(1).unwrap();
+  assert_eq!(
+    header_cells[0].style.foreground,
+    Some(Color::Rgb {
+      r: 75,
+      g: 88,
+      b: 112,
+    }),
+    "table border should use the muted Cobalt and Copper rail"
+  );
+  assert_eq!(
+    header_cells[3].style.foreground,
+    Some(Color::Rgb {
+      r: 174,
+      g: 187,
+      b: 221,
+    }),
+    "table heading should be brighter than its border"
+  );
+  let value_colors = screen
+    .row(2)
+    .unwrap()
+    .iter()
+    .filter_map(|cell| cell.style.foreground)
+    .collect::<Vec<_>>();
+  for color in [
+    Color::Rgb {
+      r: 109,
+      g: 145,
+      b: 229,
+    },
+    Color::Rgb {
+      r: 215,
+      g: 155,
+      b: 91,
+    },
+    Color::Rgb {
+      r: 119,
+      g: 190,
+      b: 146,
+    },
+    Color::Rgb {
+      r: 224,
+      g: 111,
+      b: 114,
+    },
+  ] {
+    assert!(
+      value_colors.contains(&color),
+      "missing table color {color:?}"
+    );
   }
   assert_eq!(screen.height(), 4);
 }
