@@ -211,7 +211,7 @@ pub fn finish_state(state: &mut State) {
           start:       transfer.start,
           end:         current_time(),
           host:        transfer.host,
-          total_bytes: transfer.total_bytes.unwrap_or(0),
+          total_bytes: transfer.bytes_transferred,
         },
       );
       state.refresh_store_path_summary(path_id);
@@ -229,7 +229,7 @@ pub fn finish_state(state: &mut State) {
           start:       transfer.start,
           end:         current_time(),
           host:        transfer.host,
-          total_bytes: transfer.total_bytes.unwrap_or(0),
+          total_bytes: transfer.bytes_transferred,
         },
       );
       state.refresh_store_path_summary(path_id);

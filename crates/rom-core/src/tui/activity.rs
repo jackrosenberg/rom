@@ -884,8 +884,10 @@ mod tests {
     let mut state = State::new();
     let mut add = |name: &str| {
       state.get_or_create_derivation_id(
-        Derivation::parse(&format!("/nix/store/aaaaaaaa-{name}.drv"))
-          .expect("valid derivation"),
+        Derivation::parse(&format!(
+          "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}.drv"
+        ))
+        .expect("valid derivation"),
       )
     };
     let root = add("root");

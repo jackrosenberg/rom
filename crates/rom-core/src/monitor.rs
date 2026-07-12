@@ -11,11 +11,9 @@ use crate::{
   error::{Result, RomError},
   graph::GraphIndexer,
   state::{
-    BuildFail,
     BuildInfo,
     BuildStatus,
     Derivation,
-    FailType,
     State,
     StorePath,
     TransferInfo,
@@ -26,6 +24,11 @@ use crate::{
 };
 
 const DEPENDENCY_POPULATE_BUDGET_PER_LINE: usize = 1;
+/// Maximum bytes retained from any input record before the remainder is
+/// discarded. This prevents `BufRead::lines` from allocating an attacker-sized
+/// string before the monitor can apply its normal log bounds.
+pub const MAX_INPUT_RECORD_BYTES: usize = 64 * 1024;
+const TRUNCATED_RECORD_SUFFIX: &[u8] = b"... [record truncated]";
 
 #[derive(Clone, Copy, Default)]
 enum HumanParserState {
@@ -66,9 +69,11 @@ impl<W: Write> Monitor<W> {
   }
 
   /// Process all lines and append the final graph.
-  pub fn process_stream<R: BufRead>(&mut self, reader: R) -> Result<()> {
-    for line in reader.lines() {
-      self.process_line(&line.map_err(RomError::Io)?)?;
+  pub fn process_stream<R: BufRead>(&mut self, mut reader: R) -> Result<()> {
+    while let Some(line) =
+      read_bounded_line(&mut reader).map_err(RomError::Io)?
+    {
+      self.process_line(&line)?;
     }
     self.finish()
   }
@@ -98,6 +103,7 @@ impl<W: Write> Monitor<W> {
     if self.finished {
       return Err(RomError::other("monitor is already finished"));
     }
+    self.emit_action_log(&action)?;
     let changed = self.apply_action(action);
     let populated = self
       .graph
@@ -165,7 +171,11 @@ impl<W: Write> Monitor<W> {
       },
     };
 
-    match &action {
+    self.process_action(action)
+  }
+
+  fn emit_action_log(&mut self, action: &Actions) -> Result<()> {
+    match action {
       Actions::Message { msg, raw_msg, .. } => {
         let line = if self.config.use_color {
           msg.as_str()
@@ -186,12 +196,13 @@ impl<W: Write> Monitor<W> {
       Actions::Start { .. } | Actions::Stop { .. } | Actions::Result { .. } => {
       },
     }
-
-    Ok(self.apply_action(action))
+    Ok(())
   }
 
   fn apply_action(&mut self, action: Actions) -> bool {
-    let changed = update::process_message(&mut self.state, action.clone());
+    // Observe borrowed protocol data before the state updater consumes it. This
+    // keeps public embedding and decoded JSON on one exact-once path without a
+    // deep clone of every action and its field vectors.
     let observed = self.graph.observe_action(&mut self.state, &action);
     let planned = if let Actions::Message { msg, raw_msg, .. } = &action {
       self.graph.observe_plan_line(
@@ -201,6 +212,7 @@ impl<W: Write> Monitor<W> {
     } else {
       false
     };
+    let changed = update::process_message(&mut self.state, action);
     changed || observed || planned
   }
 
@@ -255,30 +267,7 @@ impl<W: Write> Monitor<W> {
       return Ok(self.start_human_build(trimmed));
     }
 
-    let reports_build_failure = (trimmed.contains("builder for '")
-      && trimmed.contains("failed"))
-      || trimmed.contains("Cannot build '");
-    if reports_build_failure && let Some(drv) = extract_derivation(trimmed) {
-      let id = self.state.get_or_create_derivation_id(drv);
-      let now = current_time();
-      let info = current_build_info(&self.state, id).unwrap_or(BuildInfo {
-        start:       now,
-        host:        Host::Localhost,
-        activity_id: None,
-      });
-      let code = trimmed
-        .split_once("exit code")
-        .and_then(|(_, tail)| {
-          tail.trim().split(|c: char| !c.is_ascii_digit()).next()
-        })
-        .and_then(|code| code.parse().ok());
-      self.state.update_build_status(id, BuildStatus::Failed {
-        info,
-        fail: BuildFail {
-          at:        now,
-          fail_type: code.map_or(FailType::Unknown, FailType::BuildFailed),
-        },
-      });
+    if update::process_human_diagnostic(&mut self.state, trimmed) {
       return Ok(true);
     }
 
@@ -310,11 +299,6 @@ impl<W: Write> Monitor<W> {
           .running_downloads
           .insert(id, transfer);
       }
-      return Ok(true);
-    }
-
-    if trimmed.starts_with("error:") || trimmed.contains(" error:") {
-      self.state.nix_errors.push(trimmed.to_string());
       return Ok(true);
     }
 
@@ -350,19 +334,6 @@ impl<W: Write> Monitor<W> {
   }
 }
 
-fn current_build_info(
-  state: &State,
-  id: crate::state::DerivationId,
-) -> Option<BuildInfo> {
-  state.get_derivation_info(id).and_then(|info| {
-    if let BuildStatus::Building(build) = &info.build_status {
-      Some(build.clone())
-    } else {
-      None
-    }
-  })
-}
-
 fn extract_quoted_path(line: &str) -> Option<&str> {
   let (_, rest) = line.split_once('\'')?;
   rest.split_once('\'').map(|(path, _)| path)
@@ -374,6 +345,51 @@ fn extract_derivation(line: &str) -> Option<Derivation> {
 
 fn extract_store_path(line: &str) -> Option<StorePath> {
   extract_quoted_path(line).and_then(StorePath::parse)
+}
+
+/// Read one newline-delimited record while bounding allocation growth. Bytes
+/// beyond the limit are consumed but not retained, keeping the next record
+/// aligned. Invalid UTF-8 is replaced just as terminal output normally is.
+pub fn read_bounded_line<R: BufRead>(
+  reader: &mut R,
+) -> std::io::Result<Option<String>> {
+  let mut bytes = Vec::new();
+  let mut saw_data = false;
+  let mut truncated = false;
+  loop {
+    let available = reader.fill_buf()?;
+    if available.is_empty() {
+      break;
+    }
+    saw_data = true;
+    let end = available
+      .iter()
+      .position(|byte| *byte == b'\n')
+      .map_or(available.len(), |position| position + 1);
+    let chunk = &available[..end];
+    let remaining = MAX_INPUT_RECORD_BYTES.saturating_sub(bytes.len());
+    let copy = remaining.min(chunk.len());
+    bytes.extend_from_slice(&chunk[..copy]);
+    truncated |= copy < chunk.len();
+    let ends_record = chunk.ends_with(b"\n");
+    reader.consume(end);
+    if ends_record {
+      break;
+    }
+  }
+  if !saw_data {
+    return Ok(None);
+  }
+  while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+    bytes.pop();
+  }
+  if truncated {
+    let keep =
+      MAX_INPUT_RECORD_BYTES.saturating_sub(TRUNCATED_RECORD_SUFFIX.len());
+    bytes.truncate(keep);
+    bytes.extend_from_slice(TRUNCATED_RECORD_SUFFIX);
+  }
+  Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn parse_host(value: &str) -> Host {

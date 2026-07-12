@@ -3,7 +3,7 @@ mod tui_runtime;
 
 use std::{
   collections::HashMap,
-  io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+  io::{self, BufReader, IsTerminal, Read, Write},
   path::PathBuf,
   process::{Child, Command, Stdio},
   sync::{
@@ -444,7 +444,9 @@ fn run_monitored_command(
 
   let stderr = child.stderr.take().expect("Failed to capture stderr");
   let stdout = child.stdout.take().expect("Failed to capture stdout");
-  let use_tui = io::stdin().is_terminal() && io::stderr().is_terminal();
+  // Rendering only requires a terminal output. Raw input/event handling is a
+  // separate capability so `command < input` still gets coordinated output.
+  let use_tui = io::stderr().is_terminal();
   let shared = MonitorShared::new();
   let stderr_thread = spawn_stderr_reader(stderr, &shared, cfg, use_tui);
   let (stdout_thread, stdout_receiver) = if use_tui {
@@ -471,6 +473,7 @@ fn run_monitored_command(
       cfg,
       stdout_receiver,
       io::stdout().is_terminal(),
+      io::stdin().is_terminal(),
     )
   } else {
     run_streaming_render_loop(&mut child, &shared, cfg)
@@ -528,13 +531,12 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
     }
 
     let _mark_done = MarkDone(stderr_done);
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
     let mut json_count = 0;
     let mut non_json_count = 0;
     let mut log_prefixes = HashMap::new();
 
-    for line in reader.lines() {
-      let line = line?;
+    while let Some(line) = rom_core::monitor::read_bounded_line(&mut reader)? {
       if let Some(json_line) = line.strip_prefix("@nix ") {
         json_count += 1;
         if let Ok(action) = serde_json::from_str::<cognos::Actions>(json_line) {
@@ -564,10 +566,14 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
             continue;
           }
 
+          let stopped_id = if let cognos::Actions::Stop { id } = &action {
+            Some(*id)
+          } else {
+            None
+          };
           let (derivation_count_before, derivation_count_after) = {
             let mut state = state.lock().unwrap();
             let derivation_count_before = state.derivation_infos.len();
-            rom_core::update::process_message(&mut state, action.clone());
             let mut graph = graph.lock().unwrap();
             graph.observe_action(&mut state, &action);
             if let cognos::Actions::Message { msg, raw_msg, .. } = &action {
@@ -576,6 +582,7 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
                 raw_msg.as_deref().unwrap_or(msg.as_str()),
               );
             }
+            rom_core::update::process_message(&mut state, action);
             let derivation_count_after = state.derivation_infos.len();
 
             (derivation_count_before, derivation_count_after)
@@ -585,7 +592,7 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
             push_log(&log_store, line);
           }
 
-          if let cognos::Actions::Stop { id } = action {
+          if let Some(id) = stopped_id {
             log_prefixes.remove(&id);
           }
 
@@ -778,17 +785,6 @@ fn push_log(log_store: &Arc<LogStore>, line: String) {
   log_store.push(line);
 }
 
-pub(super) fn snapshot_logs(
-  shared: &MonitorShared,
-  silent: bool,
-) -> Vec<String> {
-  if silent {
-    Vec::new()
-  } else {
-    shared.log_store.snapshot()
-  }
-}
-
 pub(super) fn console_config(
   use_color: bool,
 ) -> rom_core::console::ConsoleConfig {
@@ -807,6 +803,7 @@ pub(super) fn run_streaming_render_loop(
   let render_state = shared.state.clone();
   let render_graph = shared.graph.clone();
   let log_store = shared.log_store.clone();
+  let failure_log_store = shared.log_store.clone();
   let stderr_done = shared.stderr_done.clone();
   let silent = cfg.silent;
 
@@ -840,12 +837,31 @@ pub(super) fn run_streaming_render_loop(
     Ok(())
   });
 
-  let status = child.wait().map_err(rom_core::error::RomError::Io)?;
-  render_thread
-    .join()
-    .map_err(|_| eyre::eyre!("stderr render thread panicked"))?
-    .map_err(rom_core::error::RomError::Io)?;
-  Ok(MonitorOutcome::Completed(status.code().unwrap_or(1)))
+  let mut status = None;
+  loop {
+    if render_thread.is_finished() {
+      let render_result = render_thread
+        .join()
+        .map_err(|_| eyre::eyre!("stderr render thread panicked"))?;
+      if let Err(error) = render_result {
+        // Do not wait for a child whose stderr pipe is blocked behind the
+        // bounded parser queue after the output sink has failed.
+        failure_log_store.close();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(rom_core::error::RomError::Io(error).into());
+      }
+      let status = match status {
+        Some(status) => status,
+        None => child.wait().map_err(rom_core::error::RomError::Io)?,
+      };
+      return Ok(MonitorOutcome::Completed(status.code().unwrap_or(1)));
+    }
+    if status.is_none() {
+      status = child.try_wait().map_err(rom_core::error::RomError::Io)?;
+    }
+    thread::sleep(Duration::from_millis(10));
+  }
 }
 
 fn finish_monitored_command(
@@ -882,12 +898,10 @@ fn render_final_after_monitor(
   show_failure_errors: bool,
 ) -> eyre::Result<()> {
   let state = shared.state.lock().unwrap();
-  rom_core::console::write_final_graph(
-    io::stderr(),
-    &state,
-    console_config(io::stderr().is_terminal()),
-  )
-  .map_err(rom_core::error::RomError::Io)?;
+  let mut console = console_config(io::stderr().is_terminal());
+  console.process_exit_code = Some(exit_code);
+  rom_core::console::write_final_graph(io::stderr(), &state, console)
+    .map_err(rom_core::error::RomError::Io)?;
   if show_failure_errors && exit_code != 0 {
     let logs = shared.log_store.snapshot();
     write_post_tui_failure_errors(io::stderr(), &state, &logs)

@@ -9,6 +9,10 @@ pub struct ConsoleConfig {
   pub max_tree_depth:    usize,
   pub max_visible_lines: usize,
   pub use_color:         bool,
+  /// Evaluator process exit code when rendering a wrapper's final console.
+  /// A nonzero outcome is a failure even when stderr contained no structured
+  /// Nix diagnostic.
+  pub process_exit_code: Option<i32>,
   /// Output width in terminal columns.
   ///
   /// The rendering seam deliberately does not inspect the process terminal so
@@ -22,6 +26,7 @@ impl Default for ConsoleConfig {
       max_tree_depth:    10,
       max_visible_lines: 100,
       use_color:         true,
+      process_exit_code: None,
       width:             100,
     }
   }
@@ -66,7 +71,12 @@ pub fn write_final_graph<W: Write>(
     writeln!(writer)?;
   }
 
-  write_finished_line(&mut writer, state, config.use_color)?;
+  write_finished_line(
+    &mut writer,
+    state,
+    config.use_color,
+    config.process_exit_code,
+  )?;
   writeln!(writer)?;
   writer.flush()
 }
@@ -75,6 +85,7 @@ fn write_finished_line<W: Write>(
   writer: &mut W,
   state: &State,
   use_color: bool,
+  process_exit_code: Option<i32>,
 ) -> io::Result<()> {
   let failed = state.full_summary.failed_builds.len();
   let completed = state.full_summary.completed_builds.len();
@@ -102,6 +113,18 @@ fn write_finished_line<W: Write>(
       colored("✗", "1", use_color),
       colored(
         &format!("Exited with {nix_errors} nix {noun}"),
+        "1",
+        use_color
+      ),
+      colored(&at.to_string(), "1", use_color),
+      colored(&duration, "1", use_color),
+    )
+  } else if let Some(code) = process_exit_code.filter(|code| *code != 0) {
+    format!(
+      "{} {} at {} after {}",
+      colored("✗", "1", use_color),
+      colored(
+        &format!("Evaluator exited with status {code}"),
         "1",
         use_color
       ),

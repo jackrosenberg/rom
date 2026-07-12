@@ -6,12 +6,18 @@ use std::{
 pub const DEFAULT_TUI_LOG_LINE_LIMIT: usize = 20_000;
 pub const POST_TUI_ERROR_LINE_LIMIT: usize = 60;
 const MAX_PENDING_LOG_RECORDS: usize = 1_024;
+const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
+const MAX_PENDING_LOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AGGREGATE_LOG_BYTES: usize = 8 * 1024 * 1024;
+const TRUNCATION_MARKER: &str = "… [log truncated]";
 
 #[derive(Default)]
 struct LogStoreState {
-  lines:   VecDeque<String>,
-  pending: VecDeque<String>,
-  closed:  bool,
+  lines:         VecDeque<String>,
+  pending:       VecDeque<String>,
+  lines_bytes:   usize,
+  pending_bytes: usize,
+  closed:        bool,
 }
 
 /// Bounded hand-off between the stderr parser and renderer.
@@ -30,18 +36,36 @@ impl LogStore {
   }
 
   pub fn push(&self, line: String) {
+    let line = truncate_record(line);
+    let bytes = line.len();
     let mut state = self.state.lock().unwrap();
-    while state.pending.len() >= MAX_PENDING_LOG_RECORDS && !state.closed {
+    loop {
+      while state.lines.len() >= DEFAULT_TUI_LOG_LINE_LIMIT
+        || state.lines_bytes + state.pending_bytes + bytes.saturating_mul(2)
+          > MAX_AGGREGATE_LOG_BYTES
+      {
+        let Some(evicted) = state.lines.pop_front() else {
+          break;
+        };
+        state.lines_bytes = state.lines_bytes.saturating_sub(evicted.len());
+      }
+      let pending_full = state.pending.len() >= MAX_PENDING_LOG_RECORDS
+        || state.pending_bytes + bytes > MAX_PENDING_LOG_BYTES;
+      let aggregate_full =
+        state.lines_bytes + state.pending_bytes + bytes.saturating_mul(2)
+          > MAX_AGGREGATE_LOG_BYTES;
+      if (!pending_full && !aggregate_full) || state.closed {
+        break;
+      }
       state = self.space.wait(state).unwrap();
     }
     if state.closed {
       return;
     }
+    state.pending_bytes += bytes;
+    state.lines_bytes += bytes;
     state.pending.push_back(line.clone());
     state.lines.push_back(line);
-    if state.lines.len() > DEFAULT_TUI_LOG_LINE_LIMIT {
-      state.lines.pop_front();
-    }
   }
 
   /// Release a producer if rendering has terminated unexpectedly.
@@ -53,7 +77,8 @@ impl LogStore {
   /// Drain parsed lines that have not yet been streamed to the terminal.
   pub fn drain_pending(&self) -> Vec<String> {
     let mut state = self.state.lock().unwrap();
-    let drained = state.pending.drain(..).collect();
+    let drained = state.pending.drain(..).collect::<Vec<String>>();
+    state.pending_bytes = 0;
     self.space.notify_all();
     drained
   }
@@ -63,7 +88,9 @@ impl LogStore {
   pub fn drain_pending_up_to(&self, limit: usize) -> Vec<String> {
     let mut state = self.state.lock().unwrap();
     let count = limit.min(state.pending.len());
-    let drained = state.pending.drain(..count).collect();
+    let drained = state.pending.drain(..count).collect::<Vec<String>>();
+    let drained_bytes = drained.iter().map(String::len).sum::<usize>();
+    state.pending_bytes = state.pending_bytes.saturating_sub(drained_bytes);
     self.space.notify_all();
     drained
   }
@@ -75,6 +102,19 @@ impl LogStore {
   pub fn snapshot(&self) -> Vec<String> {
     self.state.lock().unwrap().lines.iter().cloned().collect()
   }
+}
+
+fn truncate_record(mut line: String) -> String {
+  if line.len() <= MAX_LOG_RECORD_BYTES {
+    return line;
+  }
+  let mut end = MAX_LOG_RECORD_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+  while !line.is_char_boundary(end) {
+    end = end.saturating_sub(1);
+  }
+  line.truncate(end);
+  line.push_str(TRUNCATION_MARKER);
+  line
 }
 
 pub fn post_tui_failure_error_lines(
@@ -281,6 +321,26 @@ mod tests {
     assert!(!store.has_pending());
     assert!(store.drain_pending().is_empty());
     assert_eq!(store.snapshot(), ["zero", "one"]);
+  }
+
+  #[test]
+  fn giant_records_are_explicitly_truncated() {
+    let store = LogStore::new();
+    store.push("x".repeat(MAX_LOG_RECORD_BYTES * 4));
+    let record = store.drain_pending().pop().unwrap();
+    assert!(record.len() <= MAX_LOG_RECORD_BYTES);
+    assert!(record.ends_with(TRUNCATION_MARKER));
+  }
+
+  #[test]
+  fn sustained_giant_logs_stay_within_aggregate_byte_budget() {
+    let store = LogStore::new();
+    for _ in 0..1_000 {
+      store.push("x".repeat(MAX_LOG_RECORD_BYTES * 2));
+      store.drain_pending();
+    }
+    let state = store.state.lock().unwrap();
+    assert!(state.lines_bytes + state.pending_bytes <= MAX_AGGREGATE_LOG_BYTES);
   }
 
   #[test]

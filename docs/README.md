@@ -76,6 +76,15 @@ The top-level `rom` crate re-exports the stream API from `rom-core`:
 Generic writers do not take terminal ownership; color and output width are
 selected through `Config`.
 
+### Migrating to 0.3
+
+The `rom`, `rom-core`, and `rom-cli` crates are now version 0.3.0, and the
+independently versioned `cognos` parser is 2.0.0. The stream monitor no longer
+accepts legacy or arbitrary `.drv` path forms: embedding callers must provide
+canonical `/nix/store/<32-character-nix-base32-hash>-<name>.drv` paths. Public
+`Monitor::process_action` now emits message and build-log actions through the
+same exact-once writer path as JSON input.
+
 ### Argument Passthrough
 
 At times, especially while you're calling ROM as a standalone executable, you

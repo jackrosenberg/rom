@@ -10,7 +10,7 @@ use rom_core::{
     State,
     StorePath,
   },
-  update::{action_may_update_state, process_message},
+  update::{action_may_update_state, finish_state, process_message},
 };
 
 #[test]
@@ -19,7 +19,9 @@ fn internal_json_plan_line_marks_derivation_planned() {
 
   let changed = process_message(&mut state, Actions::Message {
     level:   Verbosity::Info,
-    msg:     "  /nix/store/abc123-nixos-system-fool.drv".to_string(),
+    msg:     "  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-fool.\
+              drv"
+      .to_string(),
     raw_msg: None,
     file:    None,
     line:    None,
@@ -37,8 +39,11 @@ fn internal_json_plan_line_marks_derivation_planned() {
 #[test]
 fn build_start_does_not_promote_known_dependency_to_root() {
   let mut state = State::new();
-  let root_id = add_drv(&mut state, "/nix/store/aaaaaaaa-root.drv");
-  let child_path = "/nix/store/bbbbbbbb-child.drv";
+  let root_id = add_drv(
+    &mut state,
+    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv",
+  );
+  let child_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-child.drv";
   let child_id = add_drv(&mut state, child_path);
 
   state
@@ -78,8 +83,14 @@ fn build_start_does_not_promote_known_dependency_to_root() {
 #[test]
 fn transfer_changes_refresh_derivation_and_parent_summaries() {
   let mut state = State::new();
-  let parent_id = add_drv(&mut state, "/nix/store/aaaaaaaa-parent.drv");
-  let producer_id = add_drv(&mut state, "/nix/store/bbbbbbbb-producer.drv");
+  let parent_id = add_drv(
+    &mut state,
+    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-parent.drv",
+  );
+  let producer_id = add_drv(
+    &mut state,
+    "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-producer.drv",
+  );
   state
     .get_derivation_info_mut(parent_id)
     .unwrap()
@@ -248,6 +259,30 @@ fn evaluation_and_error_messages_still_update_state() {
   assert_eq!(state.evaluation_state.count, 1);
   assert!(process_message(&mut state, error));
   assert_eq!(state.nix_errors, vec!["error: builder failed"]);
+}
+
+#[test]
+fn finish_state_records_transferred_bytes_not_expected_total() {
+  let mut state = State::new();
+  let path = StorePath::parse("/nix/store/cccccccc-interrupted").unwrap();
+  let path_id = state.get_or_create_store_path_id(path);
+  state.full_summary.running_downloads.insert(
+    path_id,
+    rom_core::state::TransferInfo {
+      start:             0.0,
+      host:              cognos::Host::Localhost,
+      activity_id:       7,
+      bytes_transferred: 37,
+      total_bytes:       Some(1_000),
+    },
+  );
+
+  finish_state(&mut state);
+
+  assert_eq!(
+    state.full_summary.completed_downloads[&path_id].total_bytes,
+    37
+  );
 }
 
 fn add_drv(state: &mut State, path: &str) -> usize {

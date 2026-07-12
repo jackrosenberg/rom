@@ -3,16 +3,16 @@ resolver = "3"
 members = ["crates/*", "rom"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92.0"
 description = "Pretty build graphs for your pretty Nix builds"
 license = "EUPL-1.2"
 
 [workspace.dependencies]
-cognos = { path = "./crates/cognos", version = "1.0.0" }  # cognos is versioned independently
-rom-cli = { path = "./crates/rom-cli", version = "0.2.0" }
-rom-core = { path = "./crates/rom-core", version = "0.2.0" }
+cognos = { path = "./crates/cognos", version = "2.0.0" }  # cognos is versioned independently
+rom-cli = { path = "./crates/rom-cli", version = "0.3.0" }
+rom-core = { path = "./crates/rom-core", version = "0.3.0" }
 
 anyhow = "1.0.102"
 chrono = "0.4.44"

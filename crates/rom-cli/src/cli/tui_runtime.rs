@@ -28,7 +28,6 @@ use super::{
   WrapperConfig,
   console_config,
   run_streaming_render_loop,
-  snapshot_logs,
 };
 
 const MAX_STREAMED_LOG_RECORDS_PER_FRAME: usize = 32;
@@ -42,6 +41,7 @@ struct TerminalSession {
   terminal_height: u16,
   scroll_bottom:   Option<u16>,
   previous:        Option<rom_core::tui::Screen>,
+  raw_mode:        bool,
 }
 
 fn graph_region_height(terminal_height: u16) -> u16 {
@@ -59,9 +59,11 @@ fn graph_height_budget(terminal_height: u16, mandatory_height: u16) -> u16 {
 }
 
 impl TerminalSession {
-  fn enter(stdout_is_tty: bool) -> io::Result<Self> {
+  fn enter(stdout_is_tty: bool, interactive: bool) -> io::Result<Self> {
     let mut stderr = io::stderr();
-    terminal::enable_raw_mode()?;
+    if interactive {
+      terminal::enable_raw_mode()?;
+    }
 
     let entered = (|| {
       let (terminal_width, terminal_height) = terminal::size()?;
@@ -86,6 +88,7 @@ impl TerminalSession {
         terminal_height,
         scroll_bottom: None,
         previous: None,
+        raw_mode: interactive,
       })
     })();
 
@@ -96,7 +99,9 @@ impl TerminalSession {
         SetAttribute(Attribute::Reset),
         cursor::Show
       );
-      let _ = terminal::disable_raw_mode();
+      if interactive {
+        let _ = terminal::disable_raw_mode();
+      }
     }
     entered
   }
@@ -135,7 +140,6 @@ impl TerminalSession {
   fn draw(
     &mut self,
     state: &rom_core::state::RenderSnapshot,
-    logs: &[String],
     new_logs: &[String],
     config: &rom_core::tui::TuiConfig,
   ) -> io::Result<()> {
@@ -167,21 +171,16 @@ impl TerminalSession {
     execute!(self.stderr, BeginSynchronizedUpdate)?;
     let update_result: io::Result<()> = (|| {
       if terminal_resized {
-        // Existing normal-screen rows may have been reflowed by the terminal,
-        // so their old cursor coordinates are no longer meaningful. Clearing
-        // individual retained rows would leave wrapped graph fragments behind.
-        queue!(self.stderr, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        if origin_y > 0 {
-          let log_tail = rom_core::tui::render_retained_log_tail(
-            width,
-            origin_y,
-            logs,
-            new_logs.len(),
-          );
-          for y in 0..log_tail.height() {
-            queue!(self.stderr, cursor::MoveTo(0, y))?;
-            log_tail.write_ansi_row(y, &mut self.stderr)?;
-          }
+        // Never clear the normal screen: it contains child stdout that is not
+        // retained by ROM and therefore cannot be reconstructed. Clear only
+        // the union of the old and new transient graph regions.
+        let start = self.origin_y.min(origin_y).min(terminal_height);
+        for y in start..terminal_height {
+          queue!(
+            self.stderr,
+            cursor::MoveTo(0, y),
+            Clear(ClearType::CurrentLine)
+          )?;
         }
         self.previous = None;
       } else if region_resized {
@@ -282,7 +281,9 @@ impl Drop for TerminalSession {
       cursor::Show,
       EndSynchronizedUpdate
     );
-    let _ = terminal::disable_raw_mode();
+    if self.raw_mode {
+      let _ = terminal::disable_raw_mode();
+    }
   }
 }
 
@@ -314,8 +315,7 @@ impl TuiRuntime {
       }
     };
     let state = shared.state.lock().unwrap().render_snapshot();
-    let logs = snapshot_logs(shared, silent);
-    terminal.draw(&state, &logs, &new_logs, config)
+    terminal.draw(&state, &new_logs, config)
   }
 }
 
@@ -325,8 +325,10 @@ pub(super) fn run_tui_render_loop(
   cfg: &WrapperConfig,
   stdout_receiver: Receiver<Vec<u8>>,
   stdout_is_tty: bool,
+  interactive: bool,
 ) -> eyre::Result<MonitorOutcome> {
-  let Ok(mut terminal) = TerminalSession::enter(stdout_is_tty) else {
+  let Ok(mut terminal) = TerminalSession::enter(stdout_is_tty, interactive)
+  else {
     let relay = thread::spawn(move || -> io::Result<()> {
       let stdout = io::stdout();
       let mut stdout = stdout.lock();
@@ -352,7 +354,8 @@ pub(super) fn run_tui_render_loop(
   let mut requested_outcome = None;
 
   loop {
-    if requested_outcome.is_none()
+    if interactive
+      && requested_outcome.is_none()
       && let Some(outcome) = handle_tui_events(child, &mut status)?
     {
       // Keep rendering until both pipe readers have delivered their bounded

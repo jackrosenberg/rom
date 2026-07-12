@@ -1,15 +1,12 @@
-use rom_core::{
-  graph::GraphIndexer,
-  state::{
-    ActivityStatus,
-    BuildInfo,
-    BuildStatus,
-    Derivation,
-    InputDerivation,
-    State,
-    StorePath,
-    TransferInfo,
-  },
+use rom_core::state::{
+  ActivityStatus,
+  BuildInfo,
+  BuildStatus,
+  Derivation,
+  InputDerivation,
+  State,
+  StorePath,
+  TransferInfo,
 };
 
 #[test]
@@ -30,8 +27,10 @@ fn test_get_or_create_ids() {
 #[test]
 fn plan_derivation_marks_requested_build_as_waiting_root() {
   let mut state = State::new();
-  let drv =
-    Derivation::parse("/nix/store/abc123-nixos-system-fool.drv").unwrap();
+  let drv = Derivation::parse(
+    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-fool.drv",
+  )
+  .unwrap();
 
   let drv_id = state.plan_derivation(drv);
 
@@ -44,7 +43,9 @@ fn plan_derivation_marks_requested_build_as_waiting_root() {
 #[test]
 fn render_snapshot_drops_transient_diagnostics() {
   let mut state = State::new();
-  let drv = Derivation::parse("/nix/store/abc123-hello.drv").unwrap();
+  let drv =
+    Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello.drv")
+      .unwrap();
   let drv_id = state.plan_derivation(drv);
   state.nix_errors.push("error: failed".to_string());
 
@@ -81,13 +82,19 @@ fn render_snapshot_keeps_transfer_store_path_names() {
 #[test]
 fn render_snapshot_prunes_unfocused_derivations() {
   let mut state = State::new();
-  let root_id = state
-    .plan_derivation(Derivation::parse("/nix/store/abc123-root.drv").unwrap());
+  let root_id = state.plan_derivation(
+    Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv")
+      .unwrap(),
+  );
   let active_id = state.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/abc123-active.drv").unwrap(),
+    Derivation::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-active.drv")
+      .unwrap(),
   );
   let inactive_id = state.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/abc123-inactive.drv").unwrap(),
+    Derivation::parse(
+      "/nix/store/cccccccccccccccccccccccccccccccc-inactive.drv",
+    )
+    .unwrap(),
   );
 
   for child_id in [active_id, inactive_id] {
@@ -118,8 +125,10 @@ fn render_snapshot_prunes_unfocused_derivations() {
 
   for i in 0..400 {
     state.plan_derivation(
-      Derivation::parse(&format!("/nix/store/abc123-unrelated-{i}.drv"))
-        .unwrap(),
+      Derivation::parse(&format!(
+        "/nix/store/dddddddddddddddddddddddddddddddd-unrelated-{i}.drv"
+      ))
+      .unwrap(),
     );
   }
 
@@ -140,13 +149,17 @@ fn render_snapshot_prunes_unfocused_derivations() {
 #[test]
 fn render_snapshot_expands_relevant_optional_branches_beyond_direct_children() {
   let mut state = State::new();
-  let root_id = state
-    .plan_derivation(Derivation::parse("/nix/store/abc123-root.drv").unwrap());
+  let root_id = state.plan_derivation(
+    Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv")
+      .unwrap(),
+  );
   let middle_id = state.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/abc123-middle.drv").unwrap(),
+    Derivation::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-middle.drv")
+      .unwrap(),
   );
   let leaf_id = state.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/abc123-leaf.drv").unwrap(),
+    Derivation::parse("/nix/store/cccccccccccccccccccccccccccccccc-leaf.drv")
+      .unwrap(),
   );
 
   for (parent, child) in [(root_id, middle_id), (middle_id, leaf_id)] {
@@ -189,7 +202,10 @@ fn render_snapshot_expands_relevant_optional_branches_beyond_direct_children() {
 fn render_snapshot_keeps_visible_activity_phases_only() {
   let mut state = State::new();
   let drv_id = state.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/abc123-building.drv").unwrap(),
+    Derivation::parse(
+      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-building.drv",
+    )
+    .unwrap(),
   );
   state.update_build_status(
     drv_id,
@@ -201,7 +217,9 @@ fn render_snapshot_keeps_visible_activity_phases_only() {
   );
   state.activities.insert(7, ActivityStatus {
     activity: cognos::Activities::Build as u8,
-    text:     "building '/nix/store/abc123-building.drv'".to_string(),
+    text:     "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-building.\
+               drv'"
+      .to_string(),
     parent:   None,
     phase:    Some("configurePhase".to_string()),
     progress: None,
@@ -226,8 +244,10 @@ fn summary_propagation_handles_deep_shared_and_cyclic_graphs() {
   let ids = (0..2_500)
     .map(|index| {
       state.get_or_create_derivation_id(
-        Derivation::parse(&format!("/nix/store/hash-node-{index}.drv"))
-          .unwrap(),
+        Derivation::parse(&format!(
+          "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-node-{index}.drv"
+        ))
+        .unwrap(),
       )
     })
     .collect::<Vec<_>>();
@@ -251,13 +271,22 @@ fn summary_propagation_handles_deep_shared_and_cyclic_graphs() {
 
   let mut cyclic = State::new();
   let a = cyclic.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/hash-cycle-a.drv").unwrap(),
+    Derivation::parse(
+      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cycle-a.drv",
+    )
+    .unwrap(),
   );
   let b = cyclic.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/hash-cycle-b.drv").unwrap(),
+    Derivation::parse(
+      "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cycle-b.drv",
+    )
+    .unwrap(),
   );
   let c = cyclic.get_or_create_derivation_id(
-    Derivation::parse("/nix/store/hash-cycle-c.drv").unwrap(),
+    Derivation::parse(
+      "/nix/store/cccccccccccccccccccccccccccccccc-cycle-c.drv",
+    )
+    .unwrap(),
   );
   connect(&mut cyclic, a, b);
   connect(&mut cyclic, b, c);
@@ -287,84 +316,4 @@ fn connect(state: &mut State, parent: usize, child: usize) {
     .unwrap()
     .derivation_parents
     .insert(parent);
-}
-
-#[test]
-fn planned_derivation_dependencies_are_populated_incrementally() {
-  let dir = tempfile::tempdir().unwrap();
-  let leaf_path =
-    write_test_drv(dir.path(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-leaf", &[]);
-  let root_path =
-    write_test_drv(dir.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root", &[
-      &leaf_path,
-    ]);
-
-  let mut state = State::new();
-  let mut graph = GraphIndexer::new();
-  let root_id =
-    graph.plan_derivation(&mut state, Derivation::parse(&root_path).unwrap());
-  let leaf_id =
-    graph.plan_derivation(&mut state, Derivation::parse(&leaf_path).unwrap());
-
-  assert!(state.forest_roots.contains(&root_id));
-  assert!(state.forest_roots.contains(&leaf_id));
-
-  wait_for_graph(&mut graph, &mut state, |state| {
-    state
-      .get_derivation_info(root_id)
-      .unwrap()
-      .input_derivations
-      .iter()
-      .any(|input| input.derivation == leaf_id)
-  });
-
-  let root_inputs: Vec<InputDerivation> = state
-    .get_derivation_info(root_id)
-    .unwrap()
-    .input_derivations
-    .clone();
-  assert!(root_inputs.iter().any(|input| input.derivation == leaf_id));
-  assert!(
-    state
-      .get_derivation_info(leaf_id)
-      .unwrap()
-      .derivation_parents
-      .contains(&root_id)
-  );
-  assert!(state.forest_roots.contains(&root_id));
-  assert!(!state.forest_roots.contains(&leaf_id));
-}
-
-fn wait_for_graph(
-  graph: &mut GraphIndexer,
-  state: &mut State,
-  ready: impl Fn(&State) -> bool,
-) {
-  for _ in 0..100 {
-    graph.populate_pending(state, 4);
-    if ready(state) {
-      return;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(10));
-  }
-  panic!("graph indexer did not finish in time");
-}
-
-fn write_test_drv(
-  dir: &std::path::Path,
-  name: &str,
-  input_paths: &[&str],
-) -> String {
-  let path = dir.join(format!("{name}.drv"));
-  let output_path = format!("/nix/store/{name}-out");
-  let inputs = input_paths
-    .iter()
-    .map(|input| format!(r#"("{input}",["out"])"#))
-    .collect::<Vec<_>>()
-    .join(",");
-  let content = format!(
-    r#"Derive([("out","{output_path}","","")],[{inputs}],[],"x86_64-linux","/bin/sh",[],[("name","{name}")])"#
-  );
-  std::fs::write(&path, content).unwrap();
-  path.display().to_string()
 }

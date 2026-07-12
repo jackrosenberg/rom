@@ -109,7 +109,7 @@ fn message_may_update_state(level: Verbosity, msg: &str) -> bool {
   }
 
   match level {
-    Verbosity::Error => msg.contains("error:") || msg.contains("failed"),
+    Verbosity::Error => parse_nix_diagnostic(msg).is_some(),
     Verbosity::Info | Verbosity::Notice => {
       (msg.contains("evaluating") || msg.contains("copying"))
         && extract_file_name(msg).is_some()
@@ -261,41 +261,38 @@ fn handle_message(state: &mut State, level: Verbosity, msg: String) -> bool {
 
   match level {
     Verbosity::Error => {
-      // Track errors
-      if msg.contains("error:") || msg.contains("failed") {
-        state.nix_errors.push(msg.clone());
-
-        // Try to extract which build failed
-        if let Some(drv_path) = extract_derivation_from_error(&msg)
-          && let Some(drv) = Derivation::parse(&drv_path)
-        {
-          let drv_id = state.get_or_create_derivation_id(drv);
-
-          // Get build info first
-          let build_info_opt =
-            state.get_derivation_info(drv_id).and_then(|info| {
-              if let BuildStatus::Building(build_info) = &info.build_status {
-                Some(build_info.clone())
-              } else {
-                None
-              }
-            });
-
-          if let Some(build_info) = build_info_opt {
-            let fail = BuildFail {
-              at:        current_time(),
-              fail_type: parse_fail_type(&msg),
-            };
-
-            state.update_build_status(drv_id, BuildStatus::Failed {
-              info: build_info,
-              fail,
-            });
-          }
-        }
-        return true;
+      let Some(diagnostic) = parse_nix_diagnostic(&msg) else {
+        // Builder output can itself contain strings such as
+        // `compiler: error:`. Only Nix's top-level diagnostic grammar mutates
+        // build state; everything else remains an ordinary log record.
+        return changed;
+      };
+      state.nix_errors.push(msg);
+      if let Some(drv) = diagnostic.derivation {
+        let drv_id = state.get_or_create_derivation_id(drv);
+        let now = current_time();
+        let info = state
+          .get_derivation_info(drv_id)
+          .and_then(|info| {
+            match &info.build_status {
+              BuildStatus::Building(build) => Some(build.clone()),
+              _ => None,
+            }
+          })
+          .unwrap_or(BuildInfo {
+            start:       now,
+            host:        Host::Localhost,
+            activity_id: None,
+          });
+        state.update_build_status(drv_id, BuildStatus::Failed {
+          info,
+          fail: BuildFail {
+            at:        now,
+            fail_type: diagnostic.fail_type,
+          },
+        });
       }
-      changed
+      true
     },
     Verbosity::Info | Verbosity::Notice => {
       // Track info messages for evaluation progress
@@ -868,8 +865,105 @@ fn parse_host(s: &str) -> Host {
   }
 }
 
-fn extract_derivation_from_error(msg: &str) -> Option<String> {
-  extract_derivation_path(msg)
+struct NixDiagnostic {
+  derivation: Option<Derivation>,
+  fail_type:  FailType,
+}
+
+/// Parse only top-level Nix diagnostics. SGR styling is ignored for structure,
+/// while the original message remains available for display.
+fn parse_nix_diagnostic(msg: &str) -> Option<NixDiagnostic> {
+  let clean = strip_sgr(msg);
+  let diagnostic = clean.trim_start().strip_prefix("error:")?.trim_start();
+
+  let builder = diagnostic.starts_with("builder for '");
+  let cannot_build = diagnostic.starts_with("Cannot build '");
+  let dependency = (diagnostic.contains("dependency of derivation '")
+    || diagnostic.contains("dependencies of derivation '")
+    || cannot_build)
+    && diagnostic.to_ascii_lowercase().contains("dependenc")
+    && diagnostic.to_ascii_lowercase().contains("failed");
+
+  let derivation = if builder || cannot_build || dependency {
+    extract_derivation_path(diagnostic)
+      .and_then(|path| Derivation::parse(&path))
+  } else {
+    None
+  };
+  let fail_type = if dependency {
+    FailType::DependencyFailed
+  } else if builder || cannot_build {
+    parse_fail_type(diagnostic)
+  } else {
+    FailType::Unknown
+  };
+  Some(NixDiagnostic {
+    derivation,
+    fail_type,
+  })
+}
+
+/// Apply a human-formatted top-level diagnostic through the same structural
+/// parser used for internal-json messages.
+pub(crate) fn process_human_diagnostic(state: &mut State, msg: &str) -> bool {
+  let Some(diagnostic) = parse_nix_diagnostic(msg) else {
+    return false;
+  };
+  state.nix_errors.push(msg.to_string());
+  if let Some(drv) = diagnostic.derivation {
+    let drv_id = state.get_or_create_derivation_id(drv);
+    let now = current_time();
+    let info = state
+      .get_derivation_info(drv_id)
+      .and_then(|info| {
+        match &info.build_status {
+          BuildStatus::Building(build) => Some(build.clone()),
+          _ => None,
+        }
+      })
+      .unwrap_or(BuildInfo {
+        start:       now,
+        host:        Host::Localhost,
+        activity_id: None,
+      });
+    state.update_build_status(drv_id, BuildStatus::Failed {
+      info,
+      fail: BuildFail {
+        at:        now,
+        fail_type: diagnostic.fail_type,
+      },
+    });
+  }
+  true
+}
+
+fn strip_sgr(value: &str) -> String {
+  let bytes = value.as_bytes();
+  let mut output = String::with_capacity(value.len());
+  let mut index = 0;
+  while index < bytes.len() {
+    if bytes[index] == 0x1B && bytes.get(index + 1) == Some(&b'[') {
+      let mut end = index + 2;
+      while let Some(byte) = bytes.get(end) {
+        end += 1;
+        if *byte == b'm' {
+          break;
+        }
+        if !byte.is_ascii_digit() && *byte != b';' && *byte != b':' {
+          end = index + 1;
+          break;
+        }
+      }
+      if end > index + 1 {
+        index = end;
+        continue;
+      }
+    }
+    let character = value[index..].chars().next().expect("UTF-8 boundary");
+    output.push(character);
+    index += character.len_utf8();
+  }
+  output
 }
 
 fn extract_file_name(msg: &str) -> Option<String> {
@@ -883,12 +977,21 @@ fn extract_file_name(msg: &str) -> Option<String> {
 }
 
 fn parse_fail_type(msg: &str) -> FailType {
-  if msg.contains("timeout") {
+  let lower = msg.to_ascii_lowercase();
+  if lower.contains("timeout") || lower.contains("timed out") {
     FailType::Timeout
-  } else if msg.contains("hash mismatch") || msg.contains("hash") {
+  } else if lower.contains("hash mismatch") {
     FailType::HashMismatch
-  } else if msg.contains("dependency failed") {
+  } else if lower.contains("dependenc") && lower.contains("failed") {
     FailType::DependencyFailed
+  } else if let Some(code) = lower
+    .split_once("exit code")
+    .and_then(|(_, tail)| {
+      tail.trim().split(|ch: char| !ch.is_ascii_digit()).next()
+    })
+    .and_then(|code| code.parse().ok())
+  {
+    FailType::BuildFailed(code)
   } else {
     FailType::Unknown
   }
