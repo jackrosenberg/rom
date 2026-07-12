@@ -6,7 +6,6 @@ use rom_core::{
     BuildStatus,
     Derivation,
     InputDerivation,
-    ProgressState,
     State,
     StorePath,
     TransferInfo,
@@ -16,7 +15,6 @@ use rom_core::{
 #[test]
 fn test_state_creation() {
   let state = State::new();
-  assert_eq!(state.progress_state, ProgressState::JustStarted);
   assert_eq!(state.total_builds(), 0);
 }
 
@@ -48,7 +46,6 @@ fn render_snapshot_drops_transient_diagnostics() {
   let mut state = State::new();
   let drv = Derivation::parse("/nix/store/abc123-hello.drv").unwrap();
   let drv_id = state.plan_derivation(drv);
-  state.push_trace("trace output");
   state.nix_errors.push("error: failed".to_string());
 
   let snapshot = state.render_snapshot();
@@ -115,7 +112,6 @@ fn render_snapshot_prunes_unfocused_derivations() {
     BuildStatus::Building(BuildInfo {
       start:       rom_core::state::current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: Some(7),
     }),
   );
@@ -142,6 +138,54 @@ fn render_snapshot_prunes_unfocused_derivations() {
 }
 
 #[test]
+fn render_snapshot_expands_relevant_optional_branches_beyond_direct_children() {
+  let mut state = State::new();
+  let root_id = state
+    .plan_derivation(Derivation::parse("/nix/store/abc123-root.drv").unwrap());
+  let middle_id = state.get_or_create_derivation_id(
+    Derivation::parse("/nix/store/abc123-middle.drv").unwrap(),
+  );
+  let leaf_id = state.get_or_create_derivation_id(
+    Derivation::parse("/nix/store/abc123-leaf.drv").unwrap(),
+  );
+
+  for (parent, child) in [(root_id, middle_id), (middle_id, leaf_id)] {
+    state
+      .get_derivation_info_mut(parent)
+      .unwrap()
+      .input_derivations
+      .push(InputDerivation {
+        derivation: child,
+        outputs:    std::collections::HashSet::new(),
+      });
+    state
+      .get_derivation_info_mut(child)
+      .unwrap()
+      .derivation_parents
+      .insert(parent);
+  }
+  state.update_build_status(leaf_id, BuildStatus::Planned);
+
+  let snapshot = state.render_snapshot();
+
+  assert!(snapshot.get_derivation_info(root_id).is_some());
+  assert!(snapshot.get_derivation_info(middle_id).is_some());
+  assert!(
+    snapshot.get_derivation_info(leaf_id).is_some(),
+    "global activity ranking needs candidates deeper than one edge"
+  );
+  assert_eq!(
+    snapshot
+      .get_derivation_info(middle_id)
+      .unwrap()
+      .input_derivations
+      .first()
+      .map(|input| input.derivation),
+    Some(leaf_id)
+  );
+}
+
+#[test]
 fn render_snapshot_keeps_visible_activity_phases_only() {
   let mut state = State::new();
   let drv_id = state.get_or_create_derivation_id(
@@ -152,7 +196,6 @@ fn render_snapshot_keeps_visible_activity_phases_only() {
     BuildStatus::Building(BuildInfo {
       start:       rom_core::state::current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: Some(7),
     }),
   );

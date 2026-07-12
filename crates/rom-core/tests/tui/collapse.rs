@@ -47,7 +47,6 @@ fn tui_prefers_active_subtrees_near_graph_root() {
     BuildStatus::Building(BuildInfo {
       start:       current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     }),
   );
@@ -55,15 +54,7 @@ fn tui_prefers_active_subtrees_near_graph_root() {
 
   let config = tui_config();
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let active_row = row_containing(&terminal, "active-leaf-1.0")
@@ -72,13 +63,8 @@ fn tui_prefers_active_subtrees_near_graph_root() {
     row_containing(&terminal, "root-1.0").expect("root should render");
   let rendered = format!("{}", terminal.backend());
   assert!(
-    !rendered.contains("waiting-only-1.0"),
-    "inactive waiting siblings should collapse into the root summary: \
-     {rendered}"
-  );
-  assert!(
-    rendered.contains("root-1.0 1 waiting"),
-    "root should summarize the collapsed waiting blocker: {rendered}"
+    rendered.contains("waiting-only-1.0"),
+    "spare graph capacity should show a waiting sibling: {rendered}"
   );
   assert!(
     active_row < root_row,
@@ -88,7 +74,7 @@ fn tui_prefers_active_subtrees_near_graph_root() {
 }
 
 #[test]
-fn tui_collapses_waiting_only_subtrees() {
+fn tui_uses_spare_capacity_for_waiting_subtrees() {
   let backend = TestBackend::new(80, 24);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
@@ -124,30 +110,20 @@ fn tui_collapses_waiting_only_subtrees() {
 
   let config = tui_config();
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
-  assert!(
-    rendered.contains("root-1.0 3 waiting"),
-    "waiting-only subtree should collapse into the nearest visible root: \
-     {rendered}"
-  );
-  assert!(
-    !rendered.contains("waiting-parent-1.0")
-      && !rendered.contains("waiting-child-1.0")
-      && !rendered.contains("waiting-leaf-1.0"),
-    "collapsed waiting-only descendants should not render as separate rows: \
-     {rendered}"
-  );
+  for name in [
+    "waiting-parent-1.0",
+    "waiting-child-1.0",
+    "waiting-leaf-1.0",
+  ] {
+    assert!(
+      rendered.contains(name),
+      "spare graph capacity should show waiting path {name}: {rendered}"
+    );
+  }
 }
 
 #[test]
@@ -164,15 +140,7 @@ fn tui_limits_large_planned_root_sets() {
   let config = tui_config();
 
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
@@ -181,17 +149,42 @@ fn tui_limits_large_planned_root_sets() {
     "large root sets should retain the first/highest-priority root: {rendered}"
   );
   assert!(
-    rendered.contains("planned-099"),
-    "large root sets should retain the tail roots: {rendered}"
+    rendered.contains("planned-001"),
+    "equally ranked roots should use stable derivation order: {rendered}"
   );
   assert!(
     !rendered.contains("planned-050"),
     "large root sets should not render every planned root: {rendered}"
   );
+  assert!(
+    rendered.contains("Waiting 100"),
+    "build panel should report the waiting root count: {rendered}"
+  );
 }
 
 #[test]
-fn tui_collapses_old_completed_dependencies_into_parent_summary() {
+fn snapshot_never_drops_mandatory_running_roots() {
+  let mut state = State::new();
+  for index in 0..257 {
+    let drv_id = add_derivation(&mut state, &format!("running-{index:03}"));
+    state.update_build_status(
+      drv_id,
+      BuildStatus::Building(BuildInfo {
+        start:       current_time(),
+        host:        cognos::Host::Localhost,
+        activity_id: None,
+      }),
+    );
+    state.forest_roots.push(drv_id);
+  }
+
+  let snapshot = state.render_snapshot();
+  assert_eq!(snapshot.forest_roots.len(), 257);
+  assert_eq!(snapshot.derivation_infos.len(), 257);
+}
+
+#[test]
+fn tui_uses_spare_capacity_for_completed_dependencies() {
   let backend = TestBackend::new(80, 24);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
@@ -217,7 +210,6 @@ fn tui_collapses_old_completed_dependencies_into_parent_summary() {
     info: BuildInfo {
       start:       now - 10.0,
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     },
     end:  now - 6.0,
@@ -226,29 +218,17 @@ fn tui_collapses_old_completed_dependencies_into_parent_summary() {
   let config = tui_config();
 
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
   assert!(
-    rendered.contains("root-1.0 1 dep built"),
-    "old completed dependency should collapse into parent suffix: {rendered}"
+    rendered.contains("completed-dep-1.0"),
+    "spare graph capacity should show completed dependency: {rendered}"
   );
   assert!(
     !rendered.contains("○"),
     "waiting rows should be color-coded instead of using a marker: {rendered}"
-  );
-  assert!(
-    !rendered.contains("completed-dep-1.0"),
-    "old completed dependency should not render as its own row: {rendered}"
   );
 }
 
@@ -284,22 +264,13 @@ fn tui_collapses_shared_dependency_references_into_parent_summary() {
     BuildStatus::Building(BuildInfo {
       start:       current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     }),
   );
   let config = tui_config();
 
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
@@ -307,8 +278,12 @@ fn tui_collapses_shared_dependency_references_into_parent_summary() {
     rendered.contains("shared-dep-1.0"),
     "shared dependency should render fully once: {rendered}"
   );
+  let second_root_row = row_text(
+    &terminal,
+    row_containing(&terminal, "second-root-1.0").expect("second root"),
+  );
   assert!(
-    rendered.contains("second-root-1.0 1 shared"),
+    second_root_row.contains("shared 1"),
     "second occurrence should collapse into a parent summary: {rendered}"
   );
   assert!(
@@ -329,7 +304,7 @@ fn tui_collapses_shared_dependency_references_into_parent_summary() {
 }
 
 #[test]
-fn tui_completed_builds_linger_then_disappear_from_graph() {
+fn tui_completed_builds_render_only_when_capacity_and_relevance_allow() {
   let backend = TestBackend::new(80, 20);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
@@ -339,7 +314,6 @@ fn tui_completed_builds_linger_then_disappear_from_graph() {
     info: BuildInfo {
       start:       now - 3.0,
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     },
     end:  now - 1.0,
@@ -348,15 +322,7 @@ fn tui_completed_builds_linger_then_disappear_from_graph() {
   let config = tui_config();
 
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
@@ -375,7 +341,7 @@ fn tui_completed_builds_linger_then_disappear_from_graph() {
     "completed activity should not use the old wind/leaf treatment: {rendered}"
   );
 
-  let backend = TestBackend::new(80, 20);
+  let backend = TestBackend::new(80, 9);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
   let drv_id = add_derivation(&mut state, "old-done-1.0");
@@ -383,88 +349,33 @@ fn tui_completed_builds_linger_then_disappear_from_graph() {
     info: BuildInfo {
       start:       now - 9.0,
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     },
     end:  now - 6.0,
   });
   state.forest_roots.push(drv_id);
+  for index in 0..6 {
+    let running_id = add_derivation(&mut state, &format!("running-{index}"));
+    state.update_build_status(
+      running_id,
+      BuildStatus::Building(BuildInfo {
+        start:       now,
+        host:        cognos::Host::Localhost,
+        activity_id: None,
+      }),
+    );
+    state.forest_roots.push(running_id);
+  }
 
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
   assert!(
     !rendered.contains("old-done-1.0"),
-    "old completed builds should disappear from graph: {rendered}"
-  );
-}
-
-#[test]
-fn tui_bottom_aligns_build_graph() {
-  let backend = TestBackend::new(80, 30);
-  let mut terminal = Terminal::new(backend).unwrap();
-  let state = running_state();
-  let logs = Vec::new();
-  let config = tui_config();
-
-  terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &logs,
-        &config,
-        &TuiView::default(),
-      )
-    })
-    .unwrap();
-
-  let header_row = row_text(&terminal, 0);
-  assert!(
-    header_row.contains("Builds"),
-    "status summary should render in the top header: {header_row:?}"
-  );
-  assert!(
-    header_row.contains("1 running"),
-    "header should include running build count: {header_row:?}"
-  );
-  assert!(
-    header_row.contains("elapsed"),
-    "header should include elapsed time: {header_row:?}"
-  );
-  assert!(
-    !header_row.contains("∑")
-      && !header_row.contains("⏵")
-      && !header_row.contains("⏱"),
-    "header should not use the old icon summary style: {header_row:?}"
-  );
-
-  let top_inner_row = row_text(&terminal, 2);
-  assert!(
-    !top_inner_row.contains("Dependency Graph"),
-    "graph should not start at the top: {top_inner_row:?}"
-  );
-
-  let bottom_graph_row = row_text(&terminal, 15);
-  assert!(
-    bottom_graph_row.contains("hello-1.0"),
-    "activity row should sit at the bottom of the graph pane: \
-     {bottom_graph_row:?}"
-  );
-  assert!(
-    !bottom_graph_row.contains("Builds")
-      && !bottom_graph_row.contains("elapsed"),
-    "status summary should not remain in the graph pane: {bottom_graph_row:?}"
+    "old completed builds should lose limited capacity to running builds: \
+     {rendered}"
   );
 }
 
@@ -483,7 +394,6 @@ fn tui_color_codes_activity_statuses() {
     BuildStatus::Building(BuildInfo {
       start:       now,
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     }),
   );
@@ -492,7 +402,6 @@ fn tui_color_codes_activity_statuses() {
     info: BuildInfo {
       start:       now - 3.0,
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     },
     fail: rom_core::state::BuildFail {
@@ -506,15 +415,7 @@ fn tui_color_codes_activity_statuses() {
 
   let config = tui_config();
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let buffer = terminal.backend().buffer();
@@ -524,9 +425,12 @@ fn tui_color_codes_activity_statuses() {
     row_containing(&terminal, "waiting-1.0").expect("waiting row");
   let failed_row = row_containing(&terminal, "failed-1.0").expect("failed row");
 
-  assert_eq!(buffer[(0, building_row)].fg, MOSS_GREEN);
-  assert_eq!(buffer[(0, waiting_row)].fg, MUTED_YELLOW);
-  assert_eq!(buffer[(0, failed_row)].fg, MUTED_RED);
+  assert_eq!(buffer[(0, building_row)].style.foreground, Some(MOSS_GREEN));
+  assert_eq!(
+    buffer[(0, waiting_row)].style.foreground,
+    Some(MUTED_YELLOW)
+  );
+  assert_eq!(buffer[(0, failed_row)].style.foreground, Some(MUTED_RED));
 }
 
 #[test]
@@ -556,7 +460,6 @@ fn tui_uses_muted_graph_connector_lines() {
     BuildStatus::Building(BuildInfo {
       start:       current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     }),
   );
@@ -564,20 +467,15 @@ fn tui_uses_muted_graph_connector_lines() {
 
   let config = tui_config();
   terminal
-    .draw(|frame| {
-      draw(
-        frame,
-        &state.render_snapshot(),
-        &[],
-        &config,
-        &TuiView::default(),
-      )
-    })
+    .draw(|frame| draw(frame, &state.render_snapshot(), &config))
     .unwrap();
 
   let buffer = terminal.backend().buffer();
   let child_row =
     row_containing(&terminal, "child-1.0").expect("child row should render");
-  assert_eq!(buffer[(0, child_row)].fg, GRAPH_LINE_COLOR);
-  assert!(!buffer[(0, child_row)].modifier.contains(Modifier::DIM));
+  assert_eq!(
+    buffer[(0, child_row)].style.foreground,
+    Some(GRAPH_LINE_COLOR)
+  );
+  assert!(!buffer[(0, child_row)].style.attributes.has(Attribute::Dim));
 }

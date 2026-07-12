@@ -12,4 +12,4 @@ pub use internal::{
   Platform,
   json::{Actions, Activities, Id, ResultType, Verbosity},
 };
-pub use state::{Host, OutputName, ProgressState};
+pub use state::{Host, OutputName};

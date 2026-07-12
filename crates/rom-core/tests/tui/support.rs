@@ -1,16 +1,13 @@
 pub(super) use std::collections::HashSet;
+use std::{convert::Infallible, fmt};
 
-pub(super) use ratatui::{
-  Terminal,
-  backend::TestBackend,
-  style::{Color, Modifier},
-};
 pub(super) use rom_core::{
-  display::{DisplayConfig, render_state_lines},
-  icons,
+  console::ConsoleConfig,
   state::{
+    BuildFail,
     BuildInfo,
     BuildStatus,
+    CompletedTransferInfo,
     Derivation,
     DerivationId,
     FailType,
@@ -21,26 +18,92 @@ pub(super) use rom_core::{
     TransferInfo,
     current_time,
   },
-  tui::{TuiConfig, TuiView, draw},
-  types::{DisplayFormat, LegendStyle, SummaryStyle},
+  tui::{
+    Attribute,
+    Color,
+    Screen,
+    TuiConfig,
+    render_final_graph_screen,
+    render_graph_screen,
+  },
 };
 
-pub(super) const GRAPH_LINE_COLOR: Color = Color::Rgb(82, 89, 78);
-pub(super) const MOSS_GREEN: Color = Color::Rgb(158, 190, 112);
-pub(super) const MUTED_RED: Color = Color::Rgb(204, 102, 96);
-pub(super) const MUTED_YELLOW: Color = Color::Rgb(224, 190, 96);
+pub(super) const GRAPH_LINE_COLOR: Color = Color::Rgb {
+  r: 47,
+  g: 104,
+  b: 126,
+};
+pub(super) const MOSS_GREEN: Color = Color::Rgb {
+  r: 63,
+  g: 236,
+  b: 208,
+};
+pub(super) const MUTED_RED: Color = Color::Rgb {
+  r: 234,
+  g: 65,
+  b: 83,
+};
+pub(super) const MUTED_YELLOW: Color = Color::Rgb {
+  r: 255,
+  g: 179,
+  b: 76,
+};
+
+pub(super) struct TestBackend {
+  screen: Screen,
+}
+
+impl TestBackend {
+  pub(super) fn new(width: u16, height: u16) -> Self {
+    Self {
+      screen: Screen::new(width, height),
+    }
+  }
+
+  pub(super) fn buffer(&self) -> &Screen {
+    &self.screen
+  }
+}
+
+impl fmt::Display for TestBackend {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.screen.fmt(formatter)
+  }
+}
+
+pub(super) struct Terminal {
+  backend: TestBackend,
+}
+
+impl Terminal {
+  pub(super) fn new(backend: TestBackend) -> Result<Self, Infallible> {
+    Ok(Self { backend })
+  }
+
+  pub(super) fn draw(
+    &mut self,
+    render: impl FnOnce(&mut Screen),
+  ) -> Result<(), Infallible> {
+    render(&mut self.backend.screen);
+    Ok(())
+  }
+
+  pub(super) fn backend(&self) -> &TestBackend {
+    &self.backend
+  }
+}
+
+pub(super) fn draw(
+  screen: &mut Screen,
+  state: &rom_core::state::RenderSnapshot,
+  config: &TuiConfig,
+) {
+  *screen = render_graph_screen(screen.width(), screen.height(), state, config);
+}
 
 pub(super) fn tui_config() -> TuiConfig {
   TuiConfig {
-    display:        DisplayConfig {
-      use_color: true,
-      format: DisplayFormat::Tree,
-      legend_style: LegendStyle::Table,
-      summary_style: SummaryStyle::Concise,
-      icons: &icons::UNICODE,
-      ..DisplayConfig::default()
-    },
-    log_line_limit: Some(8),
+    console: ConsoleConfig::default(),
   }
 }
 
@@ -52,7 +115,6 @@ pub(super) fn running_state() -> State {
     BuildStatus::Building(BuildInfo {
       start:       current_time(),
       host:        cognos::Host::Localhost,
-      estimate:    None,
       activity_id: None,
     }),
   );
@@ -91,17 +153,15 @@ pub(super) fn add_store_path(state: &mut State, name: &str) -> StorePathId {
   state.get_or_create_store_path_id(path)
 }
 
-pub(super) fn row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
-  let buffer = terminal.backend().buffer();
-  (0..buffer.area.width)
-    .map(|x| buffer[(x, row)].symbol())
-    .collect()
+pub(super) fn row_text(terminal: &Terminal, row: u16) -> String {
+  terminal
+    .backend()
+    .buffer()
+    .row_text(row)
+    .unwrap_or_default()
 }
 
-pub(super) fn row_containing(
-  terminal: &Terminal<TestBackend>,
-  needle: &str,
-) -> Option<u16> {
+pub(super) fn row_containing(terminal: &Terminal, needle: &str) -> Option<u16> {
   let buffer = terminal.backend().buffer();
-  (0..buffer.area.height).find(|row| row_text(terminal, *row).contains(needle))
+  (0..buffer.height()).find(|row| row_text(terminal, *row).contains(needle))
 }

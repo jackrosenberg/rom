@@ -1,15 +1,8 @@
 //! State update logic for processing nix messages
 mod maintenance;
 
-use cognos::{
-  Actions,
-  Activities,
-  Host,
-  Id,
-  ProgressState,
-  ResultType,
-  Verbosity,
-};
+use cognos::{Actions, Activities, Host, Id, ResultType, Verbosity};
+pub(crate) use maintenance::{BuildSortKey, sort_key};
 pub use maintenance::{
   detect_local_completed_builds,
   finish_state,
@@ -17,25 +10,21 @@ pub use maintenance::{
 };
 use tracing::{debug, trace};
 
-use crate::{
-  cache::BuildReportCache,
-  state::{
-    ActivityProgress,
-    ActivityStatus,
-    BuildFail,
-    BuildInfo,
-    BuildReport,
-    BuildStatus,
-    CompletedTransferInfo,
-    Derivation,
-    DerivationId,
-    FailType,
-    InputDerivation,
-    State,
-    StorePath,
-    TransferInfo,
-    current_time,
-  },
+use crate::state::{
+  ActivityProgress,
+  ActivityStatus,
+  BuildFail,
+  BuildInfo,
+  BuildStatus,
+  CompletedTransferInfo,
+  Derivation,
+  DerivationId,
+  FailType,
+  InputDerivation,
+  State,
+  StorePath,
+  TransferInfo,
+  current_time,
 };
 
 /// Process a nix JSON message and update state
@@ -47,12 +36,6 @@ pub fn process_message(state: &mut State, action: Actions) -> bool {
 
   if !action_may_update_state(&action) {
     return false;
-  }
-
-  // Mark that we've received input
-  if state.progress_state == ProgressState::JustStarted {
-    state.progress_state = ProgressState::InputReceived;
-    changed = true;
   }
 
   match action {
@@ -179,15 +162,7 @@ fn handle_start(state: &mut State, start: StartAction) -> bool {
     110 => handle_post_build_hook_start(state, id, &text, &fields, now), /* PostBuildHook */
     101 => handle_file_transfer_start(state, id, &text, &fields, now), /* FileTransfer */
     100 => handle_copy_path_start(state, id, &text, &fields, now), /* CopyPath */
-    104 => {
-      // Builds activity - track this as the top-level builds activity
-      if state.builds_activity.is_none() {
-        state.builds_activity = Some(id);
-        true
-      } else {
-        false
-      }
-    },
+    104 => false,
     102 | 103 | 106 | 107 | 111 | 112 => {
       // Realise, CopyPaths, OptimiseStore, VerifyPaths, BuildWaiting, FetchTree
       // These activities have no fields and are just tracked
@@ -342,11 +317,7 @@ fn handle_message(state: &mut State, level: Verbosity, msg: String) -> bool {
     Verbosity::Talkative
     | Verbosity::Chatty
     | Verbosity::Debug
-    | Verbosity::Vomit => {
-      // These are trace-level messages, store separately
-      state.push_trace(msg);
-      true
-    },
+    | Verbosity::Vomit => changed,
     _ => changed,
   }
 }
@@ -364,7 +335,11 @@ fn handle_indented_plan_line(state: &mut State, msg: &str) -> bool {
 
   if let Some(store_path) = StorePath::parse(path) {
     let store_path_id = state.get_or_create_store_path_id(store_path);
-    return state.full_summary.planned_downloads.insert(store_path_id);
+    let changed = state.full_summary.planned_downloads.insert(store_path_id);
+    if changed {
+      state.refresh_store_path_summary(store_path_id);
+    }
+    return changed;
   }
 
   false
@@ -457,50 +432,6 @@ fn handle_result(
   }
 }
 
-/// Get build time estimate from cache
-fn get_build_estimate(
-  state: &State,
-  derivation_name: &str,
-  host: &Host,
-) -> Option<u64> {
-  // Use pname if available, otherwise derivation name
-  let lookup_name = derivation_name.to_string();
-  let host_str = host.name();
-
-  BuildReportCache::calculate_median(
-    state
-      .build_cache
-      .get(&(host_str.to_string(), lookup_name))?
-      .as_slice(),
-  )
-}
-
-/// Record completed build for future predictions
-pub(super) fn record_build_completion(
-  state: &mut State,
-  derivation_name: String,
-  platform: Option<String>,
-  start: f64,
-  end: f64,
-  host: &Host,
-) {
-  let duration_secs = end - start;
-  let completed_at = std::time::SystemTime::now();
-
-  let report = BuildReport {
-    derivation_name: derivation_name.clone(),
-    platform: platform.unwrap_or_default(),
-    duration_secs,
-    completed_at,
-    host: host.name().to_string(),
-    success: true,
-  };
-
-  // Store in state for later CSV persistence
-  let key = (host.name().to_string(), derivation_name);
-  state.build_cache.entry(key).or_default().push(report);
-}
-
 fn handle_build_start(
   state: &mut State,
   id: Id,
@@ -528,13 +459,9 @@ fn handle_build_start(
       let host =
         parse_host(fields.get(1).and_then(|v| v.as_str()).unwrap_or(""));
 
-      // Get build time estimate from cache
-      let estimate = get_build_estimate(state, &drv.name, &host);
-
       let build_info = BuildInfo {
         start: now,
         host,
-        estimate,
         activity_id: Some(id),
       };
 
@@ -576,12 +503,7 @@ fn handle_build_stop(state: &mut State, id: Id, now: f64) -> bool {
   let result = state.derivation_infos.iter().find_map(|(drv_id, info)| {
     if let BuildStatus::Building(build_info) = &info.build_status {
       if build_info.activity_id == Some(id) {
-        Some((
-          *drv_id,
-          build_info.clone(),
-          info.name.name.clone(),
-          info.platform.clone(),
-        ))
+        Some((*drv_id, build_info.clone()))
       } else {
         None
       }
@@ -590,14 +512,11 @@ fn handle_build_stop(state: &mut State, id: Id, now: f64) -> bool {
     }
   });
 
-  if let Some((drv_id, build_info, name, platform)) = result {
-    let start = build_info.start;
-    let host = build_info.host.clone();
+  if let Some((drv_id, build_info)) = result {
     state.update_build_status(drv_id, BuildStatus::Built {
       info: build_info,
       end:  now,
     });
-    record_build_completion(state, name, platform, start, now, &host);
     debug!("Build completed for derivation {drv_id}");
     return true;
   }
@@ -641,6 +560,7 @@ fn handle_substitute_start(
       .running_downloads
       .insert(path_id, transfer);
     state.full_summary.planned_downloads.remove(&path_id);
+    state.refresh_store_path_summary(path_id);
 
     return true;
   }
@@ -671,6 +591,7 @@ fn handle_substitute_stop(state: &mut State, id: Id, now: f64) -> bool {
         total_bytes: transfer_info.bytes_transferred,
       },
     );
+    state.refresh_store_path_summary(path_id);
     return true;
   }
 
@@ -738,6 +659,7 @@ fn handle_copy_path_start(
 
     // CopyPath is an upload from 'from' to 'to'
     state.full_summary.running_uploads.insert(path_id, transfer);
+    state.refresh_store_path_summary(path_id);
     return true;
   }
 
@@ -809,6 +731,7 @@ fn handle_transfer_stop(state: &mut State, id: Id, now: f64) -> bool {
         .completed_downloads
         .insert(path_id, completed);
     }
+    state.refresh_store_path_summary(path_id);
     return true;
   }
 
@@ -835,6 +758,7 @@ fn handle_transfer_stop(state: &mut State, id: Id, now: f64) -> bool {
         .completed_uploads
         .insert(path_id, completed);
     }
+    state.refresh_store_path_summary(path_id);
     return true;
   }
 

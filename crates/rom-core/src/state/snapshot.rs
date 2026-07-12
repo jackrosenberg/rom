@@ -1,24 +1,46 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use cognos::{Host, OutputName};
 use indexmap::IndexMap;
 
 use super::{
   ActivityId,
   ActivityStatus,
   BuildStatus,
+  CompletedTransferInfo,
   DependencySummary,
+  Derivation,
   DerivationId,
-  DerivationInfo,
   EvalInfo,
+  InputDerivation,
   State,
   StorePathId,
   StorePathInfo,
-  current_time,
 };
-use crate::state::ProgressState;
 
 const MAX_RENDER_SNAPSHOT_ROOTS: usize = 256;
-const RENDER_COMPLETED_LINGER_SECONDS: f64 = 3.0;
+const MAX_RENDER_SNAPSHOT_DERIVATIONS: usize = 2_048;
+
+/// Lightweight derivation projection used by live rendering.
+#[derive(Debug, Clone)]
+pub struct RenderDerivationInfo {
+  pub name:               Derivation,
+  pub platform:           Option<String>,
+  pub input_derivations:  Vec<InputDerivation>,
+  pub derivation_parents: HashSet<DerivationId>,
+  pub outputs:            HashMap<OutputName, StorePathId>,
+  pub input_sources:      HashSet<StorePathId>,
+  pub build_status:       BuildStatus,
+  pub dependency_built:   usize,
+  pub dependency_waiting: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RenderTransferHostSummary {
+  pub(crate) host:        Host,
+  pub(crate) completed:   usize,
+  pub(crate) total_bytes: u64,
+}
 
 /// Pruned, read-only state model for live rendering.
 ///
@@ -27,29 +49,35 @@ const RENDER_COMPLETED_LINGER_SECONDS: f64 = 3.0;
 /// using [`State`].
 #[derive(Debug, Clone)]
 pub struct RenderSnapshot {
-  pub derivation_infos: IndexMap<DerivationId, DerivationInfo>,
+  pub derivation_infos: IndexMap<DerivationId, RenderDerivationInfo>,
   pub store_path_infos: IndexMap<StorePathId, StorePathInfo>,
   pub full_summary:     DependencySummary,
   pub forest_roots:     Vec<DerivationId>,
+  pub total_root_count: usize,
   pub start_time:       f64,
-  pub progress_state:   ProgressState,
   pub activities:       HashMap<ActivityId, ActivityStatus>,
-  pub build_platform:   Option<String>,
   pub evaluation_state: EvalInfo,
-  pub builds_activity:  Option<ActivityId>,
 
-  derivation_name_index: HashMap<String, HashSet<DerivationId>>,
+  derivation_name_index:               HashMap<String, HashSet<DerivationId>>,
+  sort_keys: HashMap<DerivationId, crate::update::BuildSortKey>,
+  dependency_owners:                   HashMap<DerivationId, DerivationId>,
+  pub(crate) completed_download_hosts: Vec<RenderTransferHostSummary>,
+  pub(crate) completed_upload_hosts:   Vec<RenderTransferHostSummary>,
 }
 
 impl State {
   #[must_use]
   pub fn render_snapshot(&self) -> RenderSnapshot {
-    let now = current_time();
-    let focus_ids = self.render_focus_derivations(now);
+    let focus_ids = self.render_focus_derivations();
     let forest_roots = self.render_forest_roots(&focus_ids);
     let derivation_infos =
       self.render_derivation_infos(&focus_ids, &forest_roots);
     let derivation_name_index = derivation_name_index(&derivation_infos);
+    let dependency_owners = dependency_owners(&derivation_infos);
+    let sort_keys = derivation_infos
+      .keys()
+      .map(|id| (*id, crate::update::sort_key(self, *id)))
+      .collect();
     let activities = self.render_activities(&derivation_infos);
 
     RenderSnapshot {
@@ -57,14 +85,31 @@ impl State {
       store_path_infos: self.render_store_path_infos(),
       full_summary: self.render_dependency_summary(),
       forest_roots,
+      total_root_count: self.render_root_count(),
       start_time: self.start_time,
-      progress_state: self.progress_state.clone(),
       derivation_name_index,
+      sort_keys,
+      dependency_owners,
       activities,
-      build_platform: self.build_platform.clone(),
       evaluation_state: self.evaluation_state.clone(),
-      builds_activity: self.builds_activity,
+      completed_download_hosts: render_completed_transfer_hosts(
+        self.full_summary.completed_downloads.values(),
+      ),
+      completed_upload_hosts: render_completed_transfer_hosts(
+        self.full_summary.completed_uploads.values(),
+      ),
     }
+  }
+
+  fn render_root_count(&self) -> usize {
+    if !self.forest_roots.is_empty() {
+      return self.forest_roots.len();
+    }
+    let mut roots = HashSet::new();
+    roots.extend(self.full_summary.failed_builds.keys().copied());
+    roots.extend(self.full_summary.running_builds.keys().copied());
+    roots.extend(self.full_summary.planned_builds.iter().copied());
+    roots.len()
   }
 
   fn render_dependency_summary(&self) -> DependencySummary {
@@ -81,29 +126,22 @@ impl State {
     }
   }
 
-  fn render_focus_derivations(&self, now: f64) -> HashSet<DerivationId> {
+  fn render_focus_derivations(&self) -> HashSet<DerivationId> {
     let mut focus = HashSet::new();
 
     focus.extend(self.full_summary.failed_builds.keys().copied());
     focus.extend(self.full_summary.running_builds.keys().copied());
-    focus.extend(self.full_summary.completed_builds.iter().filter_map(
-      |(drv_id, build)| {
-        (now - build.end < RENDER_COMPLETED_LINGER_SECONDS).then_some(*drv_id)
-      },
-    ));
 
     for path_id in self
       .full_summary
       .running_downloads
       .keys()
+      .chain(self.full_summary.running_uploads.keys())
       .chain(self.full_summary.planned_downloads.iter())
     {
-      if let Some(producer) = self
-        .store_path_infos
-        .get(path_id)
-        .and_then(|info| info.producer)
-      {
-        focus.insert(producer);
+      if let Some(path) = self.store_path_infos.get(path_id) {
+        focus.extend(path.producer);
+        focus.extend(path.input_for.iter().copied());
       }
     }
 
@@ -136,20 +174,29 @@ impl State {
       self.forest_roots.clone()
     };
 
-    roots.extend(focus_ids.iter().copied());
+    let mut disconnected_focus_roots = focus_ids
+      .iter()
+      .copied()
+      .filter(|id| {
+        self
+          .derivation_infos
+          .get(id)
+          .is_some_and(|info| info.derivation_parents.is_empty())
+      })
+      .collect::<Vec<_>>();
+    disconnected_focus_roots.sort_unstable();
+    roots.extend(disconnected_focus_roots);
     dedup_derivation_ids(&mut roots);
+    roots.sort_by_key(|id| crate::update::sort_key(self, *id));
     if roots.len() <= MAX_RENDER_SNAPSHOT_ROOTS {
       return roots;
     }
 
-    let mut selected = Vec::with_capacity(MAX_RENDER_SNAPSHOT_ROOTS);
-    selected.extend(
-      roots
-        .iter()
-        .filter(|id| focus_ids.contains(id))
-        .take(MAX_RENDER_SNAPSHOT_ROOTS)
-        .copied(),
-    );
+    let mut selected = roots
+      .iter()
+      .filter(|id| focus_ids.contains(id))
+      .copied()
+      .collect::<Vec<_>>();
 
     let remaining = MAX_RENDER_SNAPSHOT_ROOTS.saturating_sub(selected.len());
     if remaining > 0 {
@@ -161,7 +208,6 @@ impl State {
     }
 
     dedup_derivation_ids(&mut selected);
-    selected.truncate(MAX_RENDER_SNAPSHOT_ROOTS);
     selected
   }
 
@@ -169,16 +215,25 @@ impl State {
     &self,
     focus_ids: &HashSet<DerivationId>,
     forest_roots: &[DerivationId],
-  ) -> IndexMap<DerivationId, DerivationInfo> {
+  ) -> IndexMap<DerivationId, RenderDerivationInfo> {
     let mut render_ids = focus_ids.clone();
     render_ids.extend(forest_roots.iter().copied());
 
+    // Keep every mandatory path, then expand optional, state-sorted branches
+    // breadth-first up to the normal snapshot cap.
     let mut snapshot_ids = render_ids.clone();
+    let mut queued = snapshot_ids.clone();
+    let mut candidates = VecDeque::new();
     for drv_id in &render_ids {
-      if let Some(info) = self.derivation_infos.get(drv_id) {
-        snapshot_ids
-          .extend(info.input_derivations.iter().map(|input| input.derivation));
-      }
+      self.queue_render_children(*drv_id, &mut queued, &mut candidates);
+    }
+
+    while snapshot_ids.len() < MAX_RENDER_SNAPSHOT_DERIVATIONS {
+      let Some(drv_id) = candidates.pop_front() else {
+        break;
+      };
+      snapshot_ids.insert(drv_id);
+      self.queue_render_children(drv_id, &mut queued, &mut candidates);
     }
 
     let mut ids = snapshot_ids.iter().copied().collect::<Vec<_>>();
@@ -186,25 +241,55 @@ impl State {
     ids
       .into_iter()
       .filter_map(|drv_id| {
-        let mut info = self.derivation_infos.get(&drv_id)?.clone();
-        info
+        let info = self.derivation_infos.get(&drv_id)?;
+        let mut input_derivations = info
           .input_derivations
-          .retain(|input| snapshot_ids.contains(&input.derivation));
-        info
-          .derivation_parents
-          .retain(|parent_id| snapshot_ids.contains(parent_id));
-        if !render_ids.contains(&drv_id) {
-          info.input_derivations.clear();
-        }
-
-        Some((drv_id, info))
+          .iter()
+          .filter(|input| snapshot_ids.contains(&input.derivation))
+          .cloned()
+          .collect::<Vec<_>>();
+        input_derivations
+          .sort_by_key(|input| crate::update::sort_key(self, input.derivation));
+        Some((drv_id, RenderDerivationInfo {
+          name: info.name.clone(),
+          platform: info.platform.clone(),
+          input_derivations,
+          derivation_parents: info
+            .derivation_parents
+            .iter()
+            .filter(|parent_id| snapshot_ids.contains(parent_id))
+            .copied()
+            .collect(),
+          outputs: info.outputs.clone(),
+          input_sources: info.input_sources.clone(),
+          build_status: info.build_status.clone(),
+          dependency_built: info.dependency_summary.completed_builds.len(),
+          dependency_waiting: info.dependency_summary.planned_builds.len(),
+        }))
       })
       .collect()
   }
 
+  fn queue_render_children(
+    &self,
+    drv_id: DerivationId,
+    queued: &mut HashSet<DerivationId>,
+    candidates: &mut VecDeque<DerivationId>,
+  ) {
+    let Some(info) = self.derivation_infos.get(&drv_id) else {
+      return;
+    };
+    for child_id in info.input_derivations.iter().map(|input| input.derivation)
+    {
+      if queued.insert(child_id) {
+        candidates.push_back(child_id);
+      }
+    }
+  }
+
   fn render_activities(
     &self,
-    derivation_infos: &IndexMap<DerivationId, DerivationInfo>,
+    derivation_infos: &IndexMap<DerivationId, RenderDerivationInfo>,
   ) -> HashMap<ActivityId, ActivityStatus> {
     let mut ids = HashSet::new();
     for info in derivation_infos.values() {
@@ -252,7 +337,7 @@ impl RenderSnapshot {
   pub fn get_derivation_info(
     &self,
     id: DerivationId,
-  ) -> Option<&DerivationInfo> {
+  ) -> Option<&RenderDerivationInfo> {
     self.derivation_infos.get(&id)
   }
 
@@ -262,6 +347,24 @@ impl RenderSnapshot {
   }
 
   #[must_use]
+  pub(crate) fn sort_key(
+    &self,
+    id: DerivationId,
+  ) -> crate::update::BuildSortKey {
+    self
+      .sort_keys
+      .get(&id)
+      .copied()
+      .unwrap_or((u8::MAX, 0, u8::MAX, 0, id))
+  }
+
+  pub(crate) fn dependency_owner(
+    &self,
+    id: DerivationId,
+  ) -> Option<DerivationId> {
+    self.dependency_owners.get(&id).copied()
+  }
+
   pub fn derivation_ids_with_name(&self, name: &str) -> Vec<DerivationId> {
     self
       .derivation_name_index
@@ -272,8 +375,84 @@ impl RenderSnapshot {
   }
 }
 
+fn render_completed_transfer_hosts<'a>(
+  transfers: impl Iterator<Item = &'a CompletedTransferInfo>,
+) -> Vec<RenderTransferHostSummary> {
+  let mut hosts: BTreeMap<String, RenderTransferHostSummary> = BTreeMap::new();
+  for transfer in transfers {
+    let Host::Remote(host) = &transfer.host else {
+      continue;
+    };
+    let summary = hosts.entry(host.clone()).or_insert_with(|| {
+      RenderTransferHostSummary {
+        host:        Host::Remote(host.clone()),
+        completed:   0,
+        total_bytes: 0,
+      }
+    });
+    summary.completed = summary.completed.saturating_add(1);
+    summary.total_bytes =
+      summary.total_bytes.saturating_add(transfer.total_bytes);
+  }
+  hosts.into_values().collect()
+}
+
+fn dependency_owners(
+  infos: &IndexMap<DerivationId, RenderDerivationInfo>,
+) -> HashMap<DerivationId, DerivationId> {
+  let mut depths = HashMap::new();
+  let mut visiting = HashSet::new();
+  for id in infos.keys().copied() {
+    derivation_depth(infos, id, &mut depths, &mut visiting);
+  }
+
+  infos
+    .iter()
+    .filter_map(|(child_id, child)| {
+      child
+        .derivation_parents
+        .iter()
+        .copied()
+        .max_by_key(|parent_id| {
+          (
+            depths.get(parent_id).copied().unwrap_or(0),
+            usize::MAX.saturating_sub(*parent_id),
+          )
+        })
+        .map(|owner| (*child_id, owner))
+    })
+    .collect()
+}
+
+fn derivation_depth(
+  infos: &IndexMap<DerivationId, RenderDerivationInfo>,
+  id: DerivationId,
+  depths: &mut HashMap<DerivationId, usize>,
+  visiting: &mut HashSet<DerivationId>,
+) -> usize {
+  if let Some(depth) = depths.get(&id) {
+    return *depth;
+  }
+  if !visiting.insert(id) {
+    return 0;
+  }
+  let depth = infos.get(&id).map_or(0, |info| {
+    info
+      .derivation_parents
+      .iter()
+      .map(|parent| {
+        derivation_depth(infos, *parent, depths, visiting).saturating_add(1)
+      })
+      .max()
+      .unwrap_or(0)
+  });
+  visiting.remove(&id);
+  depths.insert(id, depth);
+  depth
+}
+
 fn derivation_name_index(
-  derivation_infos: &IndexMap<DerivationId, DerivationInfo>,
+  derivation_infos: &IndexMap<DerivationId, RenderDerivationInfo>,
 ) -> HashMap<String, HashSet<DerivationId>> {
   let mut index: HashMap<String, HashSet<DerivationId>> = HashMap::new();
   for (id, info) in derivation_infos {

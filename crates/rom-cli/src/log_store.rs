@@ -1,65 +1,46 @@
 use std::collections::VecDeque;
 
-use rom_core::tui::TuiView;
-
 pub const DEFAULT_TUI_LOG_LINE_LIMIT: usize = 20_000;
-pub const DEFAULT_TUI_LIVE_LOG_TAIL: usize = 512;
 pub const POST_TUI_ERROR_LINE_LIMIT: usize = 60;
 
 #[derive(Default)]
 pub struct LogStore {
-  lines: VecDeque<String>,
-  limit: Option<usize>,
+  lines:   VecDeque<String>,
+  pending: VecDeque<String>,
 }
 
 impl LogStore {
-  pub fn new(limit: Option<usize>) -> Self {
-    Self {
-      lines: VecDeque::new(),
-      limit,
-    }
+  pub fn new() -> Self {
+    Self::default()
   }
 
   pub fn push(&mut self, line: String) {
+    self.pending.push_back(line.clone());
     self.lines.push_back(line);
-    if let Some(limit) = self.limit {
-      while self.lines.len() > limit {
-        self.lines.pop_front();
-      }
+    if self.lines.len() > DEFAULT_TUI_LOG_LINE_LIMIT {
+      self.lines.pop_front();
     }
   }
 
-  pub fn snapshot(&self, view: Option<&TuiView>) -> Vec<String> {
-    let snapshot_len =
-      view.and_then(|view| live_log_snapshot_len(view, self.lines.len()));
-    match snapshot_len {
-      Some(len) => {
-        self
-          .lines
-          .iter()
-          .skip(self.lines.len().saturating_sub(len))
-          .cloned()
-          .collect()
-      },
-      None => self.lines.iter().cloned().collect(),
-    }
-  }
-}
-
-pub fn live_log_snapshot_len(
-  view: &TuiView,
-  available: usize,
-) -> Option<usize> {
-  if !view.search_query.is_empty() {
-    return None;
+  /// Drain parsed lines that have not yet been streamed to the terminal.
+  pub fn drain_pending(&mut self) -> Vec<String> {
+    self.pending.drain(..).collect()
   }
 
-  let scroll = view.log_scroll.min(available);
-  Some(
-    DEFAULT_TUI_LIVE_LOG_TAIL
-      .saturating_add(scroll)
-      .min(available),
-  )
+  /// Drain at most `limit` pending records so a log burst cannot starve the
+  /// live graph renderer for an entire frame.
+  pub fn drain_pending_up_to(&mut self, limit: usize) -> Vec<String> {
+    let count = limit.min(self.pending.len());
+    self.pending.drain(..count).collect()
+  }
+
+  pub fn has_pending(&self) -> bool {
+    !self.pending.is_empty()
+  }
+
+  pub fn snapshot(&self) -> Vec<String> {
+    self.lines.iter().cloned().collect()
+  }
 }
 
 pub fn post_tui_failure_error_lines(
@@ -254,28 +235,17 @@ mod tests {
   }
 
   #[test]
-  fn live_log_snapshot_follows_bounded_tail() {
-    let view = TuiView::default();
+  fn pending_delivery_is_exactly_once_despite_retention_eviction() {
+    let mut store = LogStore::new();
+    store.push("zero".to_string());
+    store.push("one".to_string());
 
-    assert_eq!(
-      live_log_snapshot_len(&view, DEFAULT_TUI_LIVE_LOG_TAIL + 100),
-      Some(DEFAULT_TUI_LIVE_LOG_TAIL)
-    );
-  }
-
-  #[test]
-  fn live_log_snapshot_expands_for_scrollback_and_search() {
-    let mut view = TuiView {
-      log_scroll: 100,
-      ..TuiView::default()
-    };
-
-    assert_eq!(
-      live_log_snapshot_len(&view, DEFAULT_TUI_LIVE_LOG_TAIL + 1000),
-      Some(DEFAULT_TUI_LIVE_LOG_TAIL + 100)
-    );
-
-    view.search_query = "configure".to_string();
-    assert_eq!(live_log_snapshot_len(&view, 10_000), None);
+    assert!(store.has_pending());
+    assert_eq!(store.drain_pending_up_to(1), ["zero"]);
+    assert!(store.has_pending());
+    assert_eq!(store.drain_pending_up_to(1), ["one"]);
+    assert!(!store.has_pending());
+    assert!(store.drain_pending().is_empty());
+    assert_eq!(store.snapshot(), ["zero", "one"]);
   }
 }

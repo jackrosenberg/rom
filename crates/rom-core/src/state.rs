@@ -7,13 +7,10 @@ use std::{
   time::{Duration, SystemTime},
 };
 
-pub use cognos::ProgressState;
 use cognos::{Host, Id, OutputName};
 pub use identity::{Derivation, StorePath};
 use indexmap::IndexMap;
-pub use snapshot::RenderSnapshot;
-
-const MAX_RETAINED_TRACES: usize = 1_000;
+pub use snapshot::{RenderDerivationInfo, RenderSnapshot};
 
 /// Unique identifier for store paths
 pub type StorePathId = usize;
@@ -56,7 +53,6 @@ pub struct StorePathInfo {
 pub struct BuildInfo {
   pub start:       f64,
   pub host:        Host,
-  pub estimate:    Option<u64>,
   pub activity_id: Option<ActivityId>,
 }
 
@@ -104,7 +100,6 @@ pub struct DerivationInfo {
   pub build_status:           BuildStatus,
   pub dependency_summary:     DependencySummary,
   pub dependencies_populated: bool,
-  pub cached:                 bool,
   pub derivation_parents:     HashSet<DerivationId>,
   pub pname:                  Option<String>,
   pub platform:               Option<String>,
@@ -252,17 +247,6 @@ pub struct ActivityProgress {
   pub failed:   u64,
 }
 
-/// Build report for caching
-#[derive(Debug, Clone)]
-pub struct BuildReport {
-  pub derivation_name: String,
-  pub platform:        String,
-  pub duration_secs:   f64,
-  pub completed_at:    SystemTime,
-  pub host:            String,
-  pub success:         bool,
-}
-
 /// Evaluation information
 #[derive(Debug, Clone, Default)]
 pub struct EvalInfo {
@@ -278,19 +262,14 @@ pub struct State {
   pub store_path_infos:  IndexMap<StorePathId, StorePathInfo>,
   pub full_summary:      DependencySummary,
   pub forest_roots:      Vec<DerivationId>,
-  pub build_cache:       HashMap<(String, String), Vec<BuildReport>>,
   pub start_time:        f64,
-  pub progress_state:    ProgressState,
   pub store_path_ids:    HashMap<StorePath, StorePathId>,
   pub derivation_ids:    HashMap<Derivation, DerivationId>,
   derivation_name_index: HashMap<String, HashSet<DerivationId>>,
   pub touched_ids:       HashSet<DerivationId>,
   pub activities:        HashMap<ActivityId, ActivityStatus>,
   pub nix_errors:        Vec<String>,
-  pub traces:            Vec<String>,
-  pub build_platform:    Option<String>,
   pub evaluation_state:  EvalInfo,
-  pub builds_activity:   Option<ActivityId>,
   next_store_path_id:    StorePathId,
   next_derivation_id:    DerivationId,
 }
@@ -309,34 +288,17 @@ impl State {
       store_path_infos:      IndexMap::new(),
       full_summary:          DependencySummary::default(),
       forest_roots:          Vec::new(),
-      build_cache:           HashMap::new(),
       start_time:            current_time(),
-      progress_state:        ProgressState::JustStarted,
       store_path_ids:        HashMap::new(),
       derivation_ids:        HashMap::new(),
       derivation_name_index: HashMap::new(),
       touched_ids:           HashSet::new(),
       activities:            HashMap::new(),
       nix_errors:            Vec::new(),
-      traces:                Vec::new(),
-      build_platform:        None,
       evaluation_state:      EvalInfo::default(),
-      builds_activity:       None,
       next_store_path_id:    0,
       next_derivation_id:    0,
     }
-  }
-
-  #[must_use]
-  pub fn with_platform(platform: Option<String>) -> Self {
-    let mut state = Self::new();
-    state.build_platform = platform;
-    state
-  }
-
-  pub fn push_trace(&mut self, line: impl Into<String>) {
-    self.traces.push(line.into());
-    trim_vec_front(&mut self.traces, MAX_RETAINED_TRACES);
   }
 
   pub fn get_or_create_store_path_id(
@@ -379,7 +341,6 @@ impl State {
       build_status:           BuildStatus::Unknown,
       dependency_summary:     DependencySummary::default(),
       dependencies_populated: false,
-      cached:                 false,
       derivation_parents:     HashSet::new(),
       pname:                  None,
       platform:               None,
@@ -496,6 +457,35 @@ impl State {
 
     let mut summary = DependencySummary::default();
     summary.update_derivation(id, &info.build_status);
+    let path_ids = info
+      .outputs
+      .values()
+      .copied()
+      .chain(info.input_sources.iter().copied())
+      .collect::<HashSet<_>>();
+    for path_id in path_ids {
+      if self.full_summary.planned_downloads.contains(&path_id) {
+        summary.planned_downloads.insert(path_id);
+      }
+      if let Some(transfer) = self.full_summary.running_downloads.get(&path_id)
+      {
+        summary.running_downloads.insert(path_id, transfer.clone());
+      }
+      if let Some(transfer) = self.full_summary.running_uploads.get(&path_id) {
+        summary.running_uploads.insert(path_id, transfer.clone());
+      }
+      if let Some(transfer) =
+        self.full_summary.completed_downloads.get(&path_id)
+      {
+        summary
+          .completed_downloads
+          .insert(path_id, transfer.clone());
+      }
+      if let Some(transfer) = self.full_summary.completed_uploads.get(&path_id)
+      {
+        summary.completed_uploads.insert(path_id, transfer.clone());
+      }
+    }
 
     if let Some(info_mut) = self.derivation_infos.get_mut(&id) {
       info_mut.dependency_summary = summary;
@@ -539,8 +529,21 @@ impl State {
     }
   }
 
+  pub(crate) fn refresh_store_path_summary(&mut self, path_id: StorePathId) {
+    let Some(path) = self.store_path_infos.get(&path_id) else {
+      return;
+    };
+    let mut derivations = path.input_for.clone();
+    derivations.extend(path.producer);
+    for drv_id in derivations {
+      self.recompute_derivation_summary(drv_id);
+      self.propagate_to_parents(drv_id);
+      self.touched_ids.insert(drv_id);
+    }
+  }
+
   /// Propagate a status change up the parent chain by recomputing each
-  /// ancestor's dependency_summary. This is for O(1) subtree aggregation.
+  /// ancestor's dependency_summary.
   pub(crate) fn propagate_to_parents(&mut self, id: DerivationId) {
     // Collect all ancestors first to avoid borrowing issues
     let mut ancestors: Vec<DerivationId> = Vec::new();
@@ -559,10 +562,33 @@ impl State {
       }
     }
 
-    // Direct parents are collected before their parents, so this recomputes
-    // summaries from the changed node toward the roots.
-    for ancestor_id in ancestors {
-      self.recompute_derivation_summary(ancestor_id);
+    // Recompute bottom-up. A node can be both a direct parent and an ancestor
+    // through another branch, so BFS discovery order is not topological.
+    let mut pending = ancestors.into_iter().collect::<HashSet<_>>();
+    while !pending.is_empty() {
+      let mut ready = pending
+        .iter()
+        .copied()
+        .filter(|ancestor_id| {
+          self.get_derivation_info(*ancestor_id).is_none_or(|info| {
+            info
+              .input_derivations
+              .iter()
+              .all(|input| !pending.contains(&input.derivation))
+          })
+        })
+        .collect::<Vec<_>>();
+      if ready.is_empty() {
+        // Malformed cyclic graphs cannot be topologically ordered. Recompute
+        // deterministically once and terminate rather than looping forever.
+        ready.extend(pending.iter().copied());
+      }
+      ready.sort_unstable();
+      for ancestor_id in ready {
+        self.recompute_derivation_summary(ancestor_id);
+        self.touched_ids.insert(ancestor_id);
+        pending.remove(&ancestor_id);
+      }
     }
   }
 
@@ -599,29 +625,6 @@ impl State {
       .iter()
       .filter(|(_, info)| &info.host == host)
       .map(|(id, info)| (*id, info))
-      .collect()
-  }
-
-  /// Check if a derivation has a platform mismatch
-  #[must_use]
-  pub fn has_platform_mismatch(&self, id: DerivationId) -> bool {
-    if let (Some(build_platform), Some(info)) =
-      (&self.build_platform, self.get_derivation_info(id))
-      && let Some(drv_platform) = &info.platform
-    {
-      return build_platform != drv_platform;
-    }
-    false
-  }
-
-  /// Get all derivations with platform mismatches
-  #[must_use]
-  pub fn platform_mismatches(&self) -> Vec<DerivationId> {
-    self
-      .derivation_infos
-      .keys()
-      .filter(|&&id| self.has_platform_mismatch(id))
-      .copied()
       .collect()
   }
 
@@ -732,12 +735,4 @@ pub fn current_time() -> f64 {
     .duration_since(SystemTime::UNIX_EPOCH)
     .unwrap_or(Duration::ZERO)
     .as_secs_f64()
-}
-
-fn trim_vec_front<T>(items: &mut Vec<T>, max_len: usize) {
-  let trim_at = max_len + max_len / 10;
-  if items.len() > trim_at {
-    let excess = items.len() - max_len;
-    items.drain(0..excess);
-  }
 }

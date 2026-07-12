@@ -1,8 +1,15 @@
 use std::collections::HashSet;
 
-use cognos::{Actions, Activities, Verbosity};
+use cognos::{Actions, Activities, OutputName, Verbosity};
 use rom_core::{
-  state::{BuildInfo, BuildStatus, Derivation, InputDerivation, State},
+  state::{
+    BuildInfo,
+    BuildStatus,
+    Derivation,
+    InputDerivation,
+    State,
+    StorePath,
+  },
   update::{action_may_update_state, process_message},
 };
 
@@ -66,6 +73,70 @@ fn build_start_does_not_promote_known_dependency_to_root() {
   ));
   assert!(state.forest_roots.contains(&root_id));
   assert!(!state.forest_roots.contains(&child_id));
+}
+
+#[test]
+fn transfer_changes_refresh_derivation_and_parent_summaries() {
+  let mut state = State::new();
+  let parent_id = add_drv(&mut state, "/nix/store/aaaaaaaa-parent.drv");
+  let producer_id = add_drv(&mut state, "/nix/store/bbbbbbbb-producer.drv");
+  state
+    .get_derivation_info_mut(parent_id)
+    .unwrap()
+    .input_derivations
+    .push(InputDerivation {
+      derivation: producer_id,
+      outputs:    HashSet::new(),
+    });
+  state
+    .get_derivation_info_mut(producer_id)
+    .unwrap()
+    .derivation_parents
+    .insert(parent_id);
+  let path = "/nix/store/cccccccc-output";
+  let path_id =
+    state.get_or_create_store_path_id(StorePath::parse(path).unwrap());
+  state.get_store_path_info_mut(path_id).unwrap().producer = Some(producer_id);
+  state
+    .get_derivation_info_mut(producer_id)
+    .unwrap()
+    .outputs
+    .insert(OutputName::parse("out"), path_id);
+
+  assert!(process_message(&mut state, Actions::Start {
+    id:       42,
+    level:    Verbosity::Info,
+    parent:   0,
+    text:     format!("copying path '{path}'"),
+    activity: Activities::Substitute,
+    fields:   vec![serde_json::json!(path), serde_json::json!("")],
+  }));
+  assert!(
+    state
+      .get_derivation_info(producer_id)
+      .unwrap()
+      .dependency_summary
+      .running_downloads
+      .contains_key(&path_id)
+  );
+  assert!(
+    state
+      .get_derivation_info(parent_id)
+      .unwrap()
+      .dependency_summary
+      .running_downloads
+      .contains_key(&path_id)
+  );
+
+  assert!(process_message(&mut state, Actions::Stop { id: 42 }));
+  assert!(
+    state
+      .get_derivation_info(parent_id)
+      .unwrap()
+      .dependency_summary
+      .running_downloads
+      .is_empty()
+  );
 }
 
 #[test]

@@ -1,10 +1,8 @@
-use super::record_build_completion;
 use crate::state::{
   BuildStatus,
   CompletedTransferInfo,
   DerivationId,
   InputDerivation,
-  ProgressState,
   State,
   StorePathId,
   current_time,
@@ -15,14 +13,45 @@ fn build_sort_order(state: &State, drv_id: DerivationId) -> (u8, i64) {
     return (9, 0);
   };
   match &info.build_status {
-    BuildStatus::Failed { fail, .. } => (0, (fail.at * 1_000_000.0) as i64),
-    BuildStatus::Building(build_info) => {
-      (1, (build_info.start * 1_000_000.0) as i64)
+    BuildStatus::Failed { fail, .. } => {
+      return (0, (fail.at * 1_000_000.0) as i64);
     },
-    BuildStatus::Planned => (4, 0),
-    BuildStatus::Built { end, .. } => (6, -(*end * 1_000_000.0) as i64),
-    BuildStatus::Unknown => (9, 0),
+    BuildStatus::Building(build_info) => {
+      return (1, (build_info.start * 1_000_000.0) as i64);
+    },
+    BuildStatus::Planned | BuildStatus::Built { .. } | BuildStatus::Unknown => {
+    },
   }
+
+  let mut outputs = info.outputs.values();
+  if let Some(transfer) = outputs
+    .clone()
+    .filter_map(|path| state.full_summary.running_downloads.get(path))
+    .min_by_key(|transfer| (transfer.start * 1_000_000.0) as i64)
+  {
+    return (2, (transfer.start * 1_000_000.0) as i64);
+  }
+  if let Some(transfer) = outputs
+    .clone()
+    .filter_map(|path| state.full_summary.running_uploads.get(path))
+    .min_by_key(|transfer| (transfer.start * 1_000_000.0) as i64)
+  {
+    return (3, (transfer.start * 1_000_000.0) as i64);
+  }
+  match &info.build_status {
+    BuildStatus::Planned => return (4, 0),
+    BuildStatus::Built { end, .. } => {
+      return (6, -(*end * 1_000_000.0) as i64);
+    },
+    BuildStatus::Unknown
+    | BuildStatus::Building(_)
+    | BuildStatus::Failed { .. } => {},
+  }
+  if outputs.any(|path| state.full_summary.planned_downloads.contains(path)) {
+    return (5, 0);
+  }
+
+  (9, 0)
 }
 
 fn subtree_sort_order(state: &State, drv_id: DerivationId) -> (u8, i64) {
@@ -46,11 +75,26 @@ fn subtree_sort_order(state: &State, drv_id: DerivationId) -> (u8, i64) {
   {
     return (1, (build.start * 1_000_000.0) as i64);
   }
-
+  if let Some(transfer) = summary
+    .running_downloads
+    .values()
+    .min_by_key(|transfer| (transfer.start * 1_000_000.0) as i64)
+  {
+    return (2, (transfer.start * 1_000_000.0) as i64);
+  }
+  if let Some(transfer) = summary
+    .running_uploads
+    .values()
+    .min_by_key(|transfer| (transfer.start * 1_000_000.0) as i64)
+  {
+    return (3, (transfer.start * 1_000_000.0) as i64);
+  }
   if !summary.planned_builds.is_empty() {
     return (4, 0);
   }
-
+  if !summary.planned_downloads.is_empty() {
+    return (5, 0);
+  }
   if !summary.completed_builds.is_empty() {
     return (6, 0);
   }
@@ -58,31 +102,13 @@ fn subtree_sort_order(state: &State, drv_id: DerivationId) -> (u8, i64) {
   build_sort_order(state, drv_id)
 }
 
-fn sort_key(
-  state: &State,
-  drv_id: DerivationId,
-) -> (u8, i64, u8, i64, usize, usize, usize) {
+pub(crate) type BuildSortKey = (u8, i64, u8, i64, DerivationId);
+
+pub(crate) fn sort_key(state: &State, drv_id: DerivationId) -> BuildSortKey {
   let (own_a, own_b) = build_sort_order(state, drv_id);
   let (sub_a, sub_b) = subtree_sort_order(state, drv_id);
 
-  let summary = state
-    .get_derivation_info(drv_id)
-    .map(|info| &info.dependency_summary);
-
-  let running_builds = summary.map_or(0, |s| s.running_builds.len());
-  let running_downloads = summary.map_or(0, |s| s.running_downloads.len());
-  let planned =
-    summary.map_or(0, |s| s.planned_builds.len() + s.planned_downloads.len());
-
-  (
-    own_a,
-    own_b,
-    sub_a,
-    sub_b,
-    usize::MAX.saturating_sub(running_builds),
-    usize::MAX.saturating_sub(running_downloads),
-    planned,
-  )
+  (own_a, own_b, sub_a, sub_b, drv_id)
 }
 
 fn sort_tree_children(state: &mut State, drv_id: DerivationId) {
@@ -136,20 +162,10 @@ pub fn detect_local_completed_builds(state: &mut State, now: f64) -> bool {
       });
 
       if let Some(build_info) = build_info {
-        let name = state
-          .get_derivation_info(drv_id)
-          .map(|info| info.name.name.clone())
-          .unwrap_or_default();
-        let platform = state
-          .get_derivation_info(drv_id)
-          .and_then(|info| info.platform.clone());
-        let start = build_info.start;
-        let host = build_info.host.clone();
         state.update_build_status(drv_id, BuildStatus::Built {
           info: build_info,
           end:  now,
         });
-        record_build_completion(state, name, platform, start, now, &host);
         any_completed = true;
       }
     }
@@ -193,8 +209,6 @@ fn complete_build_success(state: &mut State, drv_id: DerivationId, now: f64) {
 }
 
 pub fn finish_state(state: &mut State) {
-  state.progress_state = ProgressState::Finished;
-
   let building: Vec<DerivationId> = state
     .derivation_infos
     .iter()
@@ -230,6 +244,7 @@ pub fn finish_state(state: &mut State) {
           total_bytes: transfer.total_bytes.unwrap_or(0),
         },
       );
+      state.refresh_store_path_summary(path_id);
     }
   }
 
@@ -247,6 +262,7 @@ pub fn finish_state(state: &mut State) {
           total_bytes: transfer.total_bytes.unwrap_or(0),
         },
       );
+      state.refresh_store_path_summary(path_id);
     }
   }
 }

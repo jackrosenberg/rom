@@ -1,154 +1,85 @@
-use ratatui::{
-  style::{Color, Style},
-  text::{Line, Span},
-};
+use std::collections::HashSet;
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
-  BranchConnector,
   CollapsedDependencies,
   TransferActivity,
+  TransferKind,
   TransferLookup,
   active_activity_status,
   derivation_transfer_activity,
 };
 use crate::{
-  display::format_duration,
-  state::{BuildInfo, BuildStatus, DerivationId, RenderSnapshot, StorePathId},
+  console::format_duration,
+  state::{BuildInfo, BuildStatus, DerivationId, RenderSnapshot},
   tui::{
     BUILT_GREEN,
     DOWNLOAD_BLUE,
     MOSS_GREEN,
     MUTED_RED,
     MUTED_YELLOW,
+    UPLOAD_PURPLE,
     hierarchy_style,
+    screen::{Line, Span, Style},
     secondary_style,
     spinner_frame,
   },
 };
-
-#[derive(Clone, Copy, Default)]
-pub(super) struct GraphCell(u8);
-
-const EDGE_UP: u8 = 0b0001;
-const EDGE_DOWN: u8 = 0b0010;
-const EDGE_LEFT: u8 = 0b0100;
-const EDGE_RIGHT: u8 = 0b1000;
-const EDGE_VERTICAL: u8 = EDGE_UP | EDGE_DOWN;
-const EDGE_HORIZONTAL: u8 = EDGE_LEFT | EDGE_RIGHT;
-const EDGE_TOP_LEFT_CORNER: u8 = EDGE_DOWN | EDGE_RIGHT;
-const EDGE_BOTTOM_LEFT_CORNER: u8 = EDGE_UP | EDGE_RIGHT;
-const EDGE_TOP_RIGHT_CORNER: u8 = EDGE_DOWN | EDGE_LEFT;
-const EDGE_BOTTOM_RIGHT_CORNER: u8 = EDGE_UP | EDGE_LEFT;
-const EDGE_RIGHT_TEE: u8 = EDGE_UP | EDGE_DOWN | EDGE_RIGHT;
-const EDGE_LEFT_TEE: u8 = EDGE_UP | EDGE_DOWN | EDGE_LEFT;
-const EDGE_TOP_TEE: u8 = EDGE_LEFT | EDGE_RIGHT | EDGE_DOWN;
-const EDGE_BOTTOM_TEE: u8 = EDGE_LEFT | EDGE_RIGHT | EDGE_UP;
-const EDGE_CROSS: u8 = EDGE_UP | EDGE_DOWN | EDGE_LEFT | EDGE_RIGHT;
-
-impl GraphCell {
-  fn add(&mut self, edges: u8) {
-    self.0 |= edges;
-  }
-
-  pub(super) fn clear(&mut self) {
-    self.0 = 0;
-  }
-
-  pub(super) fn has_up_edge(self) -> bool {
-    self.0 & EDGE_UP != 0
-  }
-
-  pub(super) fn has_down_edge(self) -> bool {
-    self.0 & EDGE_DOWN != 0
-  }
-
-  pub(super) fn is_vertical_rail(self) -> bool {
-    matches!(self.0, EDGE_VERTICAL | EDGE_UP | EDGE_DOWN)
-  }
-
-  fn symbol(self) -> &'static str {
-    match self.0 {
-      0 => " ",
-      EDGE_VERTICAL => "│",
-      EDGE_HORIZONTAL => "─",
-      EDGE_TOP_LEFT_CORNER => "┌",
-      EDGE_BOTTOM_LEFT_CORNER => "└",
-      EDGE_TOP_RIGHT_CORNER => "┐",
-      EDGE_BOTTOM_RIGHT_CORNER => "┘",
-      EDGE_RIGHT_TEE => "├",
-      EDGE_LEFT_TEE => "┤",
-      EDGE_TOP_TEE => "┬",
-      EDGE_BOTTOM_TEE => "┴",
-      EDGE_CROSS => "┼",
-      EDGE_LEFT => "─",
-      EDGE_RIGHT => "─",
-      EDGE_UP => "│",
-      EDGE_DOWN => "│",
-      _ => "┼",
-    }
-  }
-}
 
 const MAX_ACTIVITY_NAME_CHARS: usize = 56;
 
 #[derive(Clone)]
 enum RowActivity {
   Build,
-  Download(TransferActivity),
+  Transfer(TransferActivity),
 }
 
 fn row_activity(
   transfer_lookup: &TransferLookup,
   drv_id: DerivationId,
-  info: &crate::state::DerivationInfo,
-  now: f64,
+  info: &crate::state::RenderDerivationInfo,
 ) -> RowActivity {
-  if active_activity_status(&info.build_status, now) {
-    return RowActivity::Build;
+  match derivation_transfer_activity(transfer_lookup, drv_id) {
+    Some(transfer @ TransferActivity::Running { .. }) => {
+      RowActivity::Transfer(transfer)
+    },
+    _ if active_activity_status(&info.build_status) => RowActivity::Build,
+    Some(transfer) => RowActivity::Transfer(transfer),
+    None => RowActivity::Build,
   }
-  if let Some(transfer) = derivation_transfer_activity(transfer_lookup, drv_id)
-  {
-    return RowActivity::Download(transfer);
-  }
-  RowActivity::Build
 }
 
 pub(super) struct ActivityLine<'a> {
-  pub(super) state:            &'a RenderSnapshot,
-  pub(super) transfer_lookup:  &'a TransferLookup,
-  pub(super) drv_id:           DerivationId,
-  pub(super) info:             &'a crate::state::DerivationInfo,
-  pub(super) transfer_path_id: Option<StorePathId>,
-  pub(super) collapsed_deps:   CollapsedDependencies,
-  pub(super) branch_rails:     &'a [bool],
-  pub(super) connector:        Option<BranchConnector>,
-  pub(super) has_children:     bool,
-  pub(super) now:              f64,
-  pub(super) width:            usize,
+  pub(super) state:           &'a RenderSnapshot,
+  pub(super) transfer_lookup: &'a TransferLookup,
+  pub(super) drv_id:          DerivationId,
+  pub(super) info:            &'a crate::state::RenderDerivationInfo,
+  pub(super) collapsed_deps:  CollapsedDependencies,
+  pub(super) depth:           usize,
+  pub(super) now:             f64,
+  pub(super) width:           usize,
 }
 
 #[derive(Clone)]
 pub(super) struct RenderedActivityLine {
-  pub(super) graph_cells:      Vec<GraphCell>,
-  pub(super) body:             Vec<Span<'static>>,
-  pub(super) transfer_path_id: Option<StorePathId>,
+  pub(super) line: Line,
 }
 
 impl RenderedActivityLine {
-  pub(super) fn to_line(&self) -> Line<'static> {
-    let mut spans =
-      Vec::with_capacity(self.graph_cells.len() + self.body.len() + 1);
-    spans.extend(
+  pub(super) fn with_prefix(mut self, prefix: &str) -> Self {
+    if !prefix.is_empty() {
       self
-        .graph_cells
-        .iter()
-        .map(|cell| Span::styled(cell.symbol(), hierarchy_style())),
-    );
-    if !self.graph_cells.is_empty() {
-      spans.push(Span::raw(" "));
+        .line
+        .spans
+        .insert(0, Span::styled(prefix, hierarchy_style()));
     }
-    spans.extend(self.body.iter().cloned());
-    Line::from(spans)
+    self
+  }
+
+  pub(super) fn to_line(&self) -> Line {
+    self.line.clone()
   }
 }
 
@@ -158,60 +89,37 @@ pub(super) fn activity_line(args: ActivityLine<'_>) -> RenderedActivityLine {
     transfer_lookup,
     drv_id,
     info,
-    transfer_path_id,
     collapsed_deps,
-    branch_rails,
-    connector,
-    has_children,
+    depth,
     now,
     width,
   } = args;
-  let graph_cells =
-    activity_prefix_cells(branch_rails, connector, has_children);
-  let prefix_width = graph_cells.len() + usize::from(!graph_cells.is_empty());
-  let row_activity = row_activity(transfer_lookup, drv_id, info, now);
+  let prefix_width = depth.saturating_mul(3);
+  let row_activity = row_activity(transfer_lookup, drv_id, info);
   let (status, status_style) =
     status_indicator(&row_activity, &info.build_status, now);
   let status_prefix_width = if status.is_empty() {
     0
   } else {
-    status.chars().count() + 1
+    UnicodeWidthStr::width(status.as_str()) + 1
   };
   let suffix = activity_suffix(state, info, collapsed_deps, &row_activity);
   let elapsed = activity_elapsed(&row_activity, &info.build_status, now);
-  let name = fit_activity_name(
-    &info.name.name,
+  let display_name = disambiguated_name(state, info);
+  let body = activity_spans(
+    status,
+    status_style,
+    &display_name,
+    name_style(&row_activity, &info.build_status, depth),
+    suffix.as_deref(),
+    &elapsed,
     width,
     prefix_width,
     status_prefix_width,
-    suffix.as_deref(),
-    &elapsed,
   );
 
-  let mut body = Vec::new();
-  if !status.is_empty() {
-    body.push(Span::styled(status, status_style));
-    body.push(Span::raw(" "));
-  }
-  body.push(Span::styled(
-    name,
-    name_style(&row_activity, &info.build_status, branch_rails.len()),
-  ));
-
-  if let Some(suffix) = suffix {
-    body.push(Span::raw(" "));
-    body.push(Span::styled(suffix, secondary_style()));
-  }
-
-  if !elapsed.is_empty() {
-    body.push(Span::raw(" "));
-    body.push(Span::styled(elapsed, secondary_style()));
-  }
-
   RenderedActivityLine {
-    graph_cells,
-    body,
-    transfer_path_id,
+    line: Line::from(body),
   }
 }
 
@@ -220,99 +128,33 @@ pub(super) fn transfer_activity_line(
   transfer: &TransferActivity,
   now: f64,
   width: usize,
-) -> Option<Line<'static>> {
+) -> Option<Line> {
   let name = state
     .get_store_path_info(transfer.path_id())?
     .name
     .name
     .clone();
-  let row_activity = RowActivity::Download(transfer.clone());
+  let row_activity = RowActivity::Transfer(transfer.clone());
   let (status, status_style) =
     status_indicator(&row_activity, &BuildStatus::Unknown, now);
   let status_prefix_width = if status.is_empty() {
     0
   } else {
-    status.chars().count() + 1
+    UnicodeWidthStr::width(status.as_str()) + 1
   };
-  let suffix = download_suffix(transfer);
+  let suffix = transfer_suffix(state, transfer);
   let elapsed = activity_elapsed(&row_activity, &BuildStatus::Unknown, now);
-  let name = fit_activity_name(
+  Some(Line::from(activity_spans(
+    status,
+    status_style,
     &name,
+    name_style(&row_activity, &BuildStatus::Unknown, 0),
+    suffix.as_deref(),
+    &elapsed,
     width,
     0,
     status_prefix_width,
-    suffix.as_deref(),
-    &elapsed,
-  );
-
-  let mut spans = Vec::new();
-  if !status.is_empty() {
-    spans.push(Span::styled(status, status_style));
-    spans.push(Span::raw(" "));
-  }
-  spans.push(Span::styled(
-    name,
-    name_style(&row_activity, &BuildStatus::Unknown, 0),
-  ));
-
-  if let Some(suffix) = suffix {
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(suffix, secondary_style()));
-  }
-
-  if !elapsed.is_empty() {
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(elapsed, secondary_style()));
-  }
-
-  Some(Line::from(spans))
-}
-
-fn activity_prefix_cells(
-  branch_rails: &[bool],
-  connector: Option<BranchConnector>,
-  has_children: bool,
-) -> Vec<GraphCell> {
-  let Some(connector) = connector else {
-    return Vec::new();
-  };
-
-  let connector_col = branch_rails.len().saturating_sub(1) * 2;
-  let bridges_to_children = has_children && !branch_rails.is_empty();
-  let graph_width = connector_col + if bridges_to_children { 4 } else { 2 };
-  let mut cells = vec![GraphCell::default(); graph_width];
-
-  for rail in branch_rails
-    .iter()
-    .take(branch_rails.len().saturating_sub(1))
-    .enumerate()
-  {
-    let (index, rail) = rail;
-    if *rail {
-      cells[index * 2].add(EDGE_UP | EDGE_DOWN);
-    }
-  }
-
-  let vertical_edges = match connector {
-    BranchConnector::Start => EDGE_DOWN,
-    BranchConnector::Continue => EDGE_UP | EDGE_DOWN,
-    BranchConnector::End => EDGE_UP,
-  };
-  cells[connector_col].add(vertical_edges);
-  connect_cells(&mut cells, connector_col, connector_col + 1);
-
-  if bridges_to_children {
-    connect_cells(&mut cells, connector_col + 1, connector_col + 2);
-    cells[connector_col + 2].add(EDGE_UP);
-    connect_cells(&mut cells, connector_col + 2, connector_col + 3);
-  }
-
-  cells
-}
-
-fn connect_cells(cells: &mut [GraphCell], left: usize, right: usize) {
-  cells[left].add(EDGE_RIGHT);
-  cells[right].add(EDGE_LEFT);
+  )))
 }
 
 fn status_indicator(
@@ -321,13 +163,17 @@ fn status_indicator(
   now: f64,
 ) -> (String, Style) {
   match row_activity {
-    RowActivity::Download(TransferActivity::Running { .. }) => {
+    RowActivity::Transfer(TransferActivity::Running { kind, .. }) => {
+      let (direction, color) = match kind {
+        TransferKind::Download => ("↓", DOWNLOAD_BLUE),
+        TransferKind::Upload => ("↑", UPLOAD_PURPLE),
+      };
       (
-        format!("↓ {}", spinner_frame(now)),
-        Style::default().fg(DOWNLOAD_BLUE),
+        format!("{direction} {}", spinner_frame(now)),
+        Style::default().fg(color),
       )
     },
-    RowActivity::Download(TransferActivity::Planned { .. }) => {
+    RowActivity::Transfer(TransferActivity::PlannedDownload { .. }) => {
       ("↓".to_string(), Style::default().fg(DOWNLOAD_BLUE))
     },
     RowActivity::Build => {
@@ -355,19 +201,18 @@ fn status_indicator(
 
 fn activity_suffix(
   state: &RenderSnapshot,
-  info: &crate::state::DerivationInfo,
+  info: &crate::state::RenderDerivationInfo,
   collapsed_deps: CollapsedDependencies,
   row_activity: &RowActivity,
 ) -> Option<String> {
   let status_suffix = match row_activity {
-    RowActivity::Download(transfer) => download_suffix(transfer),
+    RowActivity::Transfer(transfer) => transfer_suffix(state, transfer),
     RowActivity::Build => {
       match &info.build_status {
         BuildStatus::Building(build) => running_suffix(state, build),
         BuildStatus::Failed { info: build, fail } => {
           Some(failed_suffix(state, build, fail))
         },
-        BuildStatus::Built { .. } if info.cached => Some("cached".to_string()),
         BuildStatus::Built { .. } => None,
         BuildStatus::Planned => None,
         BuildStatus::Unknown => None,
@@ -377,18 +222,30 @@ fn activity_suffix(
   combine_suffixes(status_suffix, collapsed_deps_suffix(collapsed_deps))
 }
 
-fn download_suffix(transfer: &TransferActivity) -> Option<String> {
-  match transfer {
-    TransferActivity::Running { transfer, .. } => {
-      transfer.total_bytes.map(|total| {
-        format!(
+fn transfer_suffix(
+  state: &RenderSnapshot,
+  activity: &TransferActivity,
+) -> Option<String> {
+  match activity {
+    TransferActivity::Running { kind, transfer, .. } => {
+      let mut parts = Vec::new();
+      if let Some(total) = transfer.total_bytes {
+        parts.push(format!(
           "{} / {}",
           format_bytes(transfer.bytes_transferred),
           format_bytes(total)
-        )
-      })
+        ));
+      }
+      if let Some(host) = remote_host_label(state, &transfer.host) {
+        let direction = match kind {
+          TransferKind::Download => "from",
+          TransferKind::Upload => "to",
+        };
+        parts.push(format!("{direction} {host}"));
+      }
+      (!parts.is_empty()).then(|| parts.join(" "))
     },
-    TransferActivity::Planned { .. } => None,
+    TransferActivity::PlannedDownload { .. } => None,
   }
 }
 
@@ -414,7 +271,7 @@ fn combine_suffixes(
   second: Option<String>,
 ) -> Option<String> {
   match (first, second) {
-    (Some(first), Some(second)) => Some(format!("{first}, {second}")),
+    (Some(first), Some(second)) => Some(format!("{first} · {second}")),
     (Some(first), None) => Some(first),
     (None, Some(second)) => Some(second),
     (None, None) => None,
@@ -423,26 +280,20 @@ fn combine_suffixes(
 
 fn collapsed_deps_suffix(deps: CollapsedDependencies) -> Option<String> {
   let mut parts = Vec::new();
-  match deps.built {
-    0 => {},
-    1 => parts.push("1 dep built".to_string()),
-    built => parts.push(format!("{built} deps built")),
+  if deps.built > 0 {
+    parts.push(format!("built {}", deps.built));
   }
-  match deps.waiting {
-    0 => {},
-    1 => parts.push("1 waiting".to_string()),
-    waiting => parts.push(format!("{waiting} waiting")),
+  if deps.waiting > 0 {
+    parts.push(format!("waiting {}", deps.waiting));
   }
-  match deps.shared {
-    0 => {},
-    1 => parts.push("1 shared".to_string()),
-    shared => parts.push(format!("{shared} shared")),
+  if deps.shared > 0 {
+    parts.push(format!("shared {}", deps.shared));
   }
 
   if parts.is_empty() {
     None
   } else {
-    Some(parts.join(", "))
+    Some(parts.join(" · "))
   }
 }
 
@@ -451,14 +302,15 @@ fn running_suffix(state: &RenderSnapshot, build: &BuildInfo) -> Option<String> {
     .activity_id
     .and_then(|id| state.activities.get(&id))
     .and_then(|activity| activity.phase.as_deref());
-  let host = remote_host(&build.host);
-
-  match (phase, host) {
-    (Some(phase), Some(host)) => Some(format!("{phase} on {host}")),
-    (Some(phase), None) => Some(phase.to_string()),
-    (None, Some(host)) => Some(format!("on {host}")),
-    (None, None) => None,
+  let host = remote_host_label(state, &build.host);
+  let mut parts = Vec::new();
+  if let Some(phase) = phase {
+    parts.push(phase.to_string());
   }
+  if let Some(host) = host {
+    parts.push(format!("on {host}"));
+  }
+  (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn failed_suffix(
@@ -485,18 +337,89 @@ fn failed_suffix(
     suffix.push_str(phase);
   }
 
-  if let Some(host) = remote_host(&build.host) {
+  if let Some(host) = remote_host_label(state, &build.host) {
     suffix.push_str(" on ");
-    suffix.push_str(host);
+    suffix.push_str(&host);
   }
 
   suffix
 }
 
-fn remote_host(host: &cognos::Host) -> Option<&str> {
-  match host {
-    cognos::Host::Remote(host) => Some(host),
-    cognos::Host::Localhost => None,
+fn remote_host_label(
+  state: &RenderSnapshot,
+  host: &cognos::Host,
+) -> Option<String> {
+  let cognos::Host::Remote(raw) = host else {
+    return None;
+  };
+  let short = short_host(raw);
+  let collides = remote_hosts(state)
+    .into_iter()
+    .any(|other| other != *raw && short_host(&other) == short);
+  Some(if collides {
+    raw.clone()
+  } else {
+    short.to_string()
+  })
+}
+
+fn short_host(host: &str) -> &str {
+  let without_scheme = host.split_once("://").map_or(host, |(_, rest)| rest);
+  let without_user = without_scheme
+    .rsplit_once('@')
+    .map_or(without_scheme, |(_, rest)| rest);
+  let without_port = without_user.split(':').next().unwrap_or(without_user);
+  without_port.split('.').next().unwrap_or(without_port)
+}
+
+fn remote_hosts(state: &RenderSnapshot) -> HashSet<String> {
+  let mut hosts = HashSet::new();
+  let mut insert = |host: &cognos::Host| {
+    if let cognos::Host::Remote(host) = host {
+      hosts.insert(host.clone());
+    }
+  };
+  for build in state.full_summary.running_builds.values() {
+    insert(&build.host);
+  }
+  for build in state.full_summary.completed_builds.values() {
+    insert(&build.host);
+  }
+  for build in state.full_summary.failed_builds.values() {
+    insert(&build.host);
+  }
+  for transfer in state
+    .full_summary
+    .running_downloads
+    .values()
+    .chain(state.full_summary.running_uploads.values())
+  {
+    insert(&transfer.host);
+  }
+  hosts
+}
+
+fn disambiguated_name(
+  state: &RenderSnapshot,
+  info: &crate::state::RenderDerivationInfo,
+) -> String {
+  let Some(platform) = info.platform.as_deref() else {
+    return info.name.name.clone();
+  };
+  let differs = state
+    .derivation_ids_with_name(&info.name.name)
+    .into_iter()
+    .filter_map(|id| state.get_derivation_info(id))
+    .any(|other| {
+      other
+        .platform
+        .as_deref()
+        .is_some_and(|other_platform| other_platform != platform)
+    });
+  if differs {
+    format!("{} [{platform}]", info.name.name)
+  } else {
+    info.name.name.clone()
   }
 }
 
@@ -506,10 +429,12 @@ fn activity_elapsed(
   now: f64,
 ) -> String {
   match row_activity {
-    RowActivity::Download(TransferActivity::Running { transfer, .. }) => {
+    RowActivity::Transfer(TransferActivity::Running { transfer, .. }) => {
       elapsed_since(transfer.start, now)
     },
-    RowActivity::Download(TransferActivity::Planned { .. }) => String::new(),
+    RowActivity::Transfer(TransferActivity::PlannedDownload { .. }) => {
+      String::new()
+    },
     RowActivity::Build => {
       match status {
         BuildStatus::Building(build) => elapsed_since(build.start, now),
@@ -532,6 +457,43 @@ fn elapsed_since(start: f64, end: f64) -> String {
   }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn activity_spans(
+  status: String,
+  status_style: Style,
+  name: &str,
+  name_style: Style,
+  suffix: Option<&str>,
+  elapsed: &str,
+  width: usize,
+  prefix_width: usize,
+  status_prefix_width: usize,
+) -> Vec<Span> {
+  let name = fit_activity_name(
+    name,
+    width,
+    prefix_width,
+    status_prefix_width,
+    suffix,
+    elapsed,
+  );
+  let mut spans = Vec::new();
+  if !status.is_empty() {
+    spans.push(Span::styled(status, status_style));
+    spans.push(Span::raw(" "));
+  }
+  spans.push(Span::styled(name, name_style));
+  if let Some(suffix) = suffix {
+    spans.push(Span::styled(" · ", secondary_style()));
+    spans.push(Span::styled(suffix, secondary_style()));
+  }
+  if !elapsed.is_empty() {
+    spans.push(Span::styled(" · ", secondary_style()));
+    spans.push(Span::styled(elapsed, secondary_style()));
+  }
+  spans
+}
+
 fn fit_activity_name(
   name: &str,
   width: usize,
@@ -540,12 +502,13 @@ fn fit_activity_name(
   suffix: Option<&str>,
   elapsed: &str,
 ) -> String {
-  let suffix_width =
-    suffix.map(|suffix| suffix.chars().count() + 1).unwrap_or(0);
+  let suffix_width = suffix
+    .map(|suffix| UnicodeWidthStr::width(suffix) + 3)
+    .unwrap_or(0);
   let elapsed_width = if elapsed.is_empty() {
     0
   } else {
-    elapsed.chars().count() + 1
+    UnicodeWidthStr::width(elapsed) + 3
   };
   let fixed_width =
     prefix_width + status_prefix_width + suffix_width + elapsed_width;
@@ -553,19 +516,29 @@ fn fit_activity_name(
     .saturating_sub(fixed_width)
     .clamp(1, MAX_ACTIVITY_NAME_CHARS);
 
-  truncate_start_chars(name, available)
+  truncate_start_width(name, available)
 }
 
-fn truncate_start_chars(text: &str, max_chars: usize) -> String {
-  if text.chars().count() <= max_chars {
+fn truncate_start_width(text: &str, max_width: usize) -> String {
+  if UnicodeWidthStr::width(text) <= max_width {
     return text.to_string();
   }
-  if max_chars <= 1 {
+  if max_width <= 1 {
     return "…".to_string();
   }
 
-  let skip = text.chars().count().saturating_sub(max_chars - 1);
-  format!("…{}", text.chars().skip(skip).collect::<String>())
+  let mut tail = Vec::new();
+  let mut width = 1;
+  for grapheme in text.graphemes(true).rev() {
+    let grapheme_width = UnicodeWidthStr::width(grapheme);
+    if width + grapheme_width > max_width {
+      break;
+    }
+    width += grapheme_width;
+    tail.push(grapheme);
+  }
+  tail.reverse();
+  format!("…{}", tail.concat())
 }
 
 fn name_style(
@@ -574,10 +547,13 @@ fn name_style(
   depth: usize,
 ) -> Style {
   match row_activity {
-    RowActivity::Download(TransferActivity::Running { .. }) => {
-      Style::default().fg(DOWNLOAD_BLUE)
+    RowActivity::Transfer(TransferActivity::Running { kind, .. }) => {
+      Style::default().fg(match kind {
+        TransferKind::Download => DOWNLOAD_BLUE,
+        TransferKind::Upload => UPLOAD_PURPLE,
+      })
     },
-    RowActivity::Download(TransferActivity::Planned { .. }) => {
+    RowActivity::Transfer(TransferActivity::PlannedDownload { .. }) => {
       Style::default().fg(MUTED_YELLOW)
     },
     RowActivity::Build => {
@@ -586,12 +562,28 @@ fn name_style(
         BuildStatus::Planned | BuildStatus::Unknown => {
           Style::default().fg(MUTED_YELLOW)
         },
-        BuildStatus::Built { .. } => Style::default().fg(Color::Gray),
+        BuildStatus::Built { .. } => Style::default().fg(BUILT_GREEN),
         BuildStatus::Building(_) if depth == 0 => {
           Style::default().fg(MOSS_GREEN)
         },
         BuildStatus::Building(_) => Style::default().fg(MOSS_GREEN),
       }
     },
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn truncation_uses_display_width_and_preserves_graphemes() {
+    let wide = truncate_start_width("prefix-日本語", 7);
+    assert!(UnicodeWidthStr::width(wide.as_str()) <= 7);
+    assert!(wide.ends_with("本語"));
+
+    let combining = truncate_start_width("prefix-e\u{301}nd", 5);
+    assert!(UnicodeWidthStr::width(combining.as_str()) <= 5);
+    assert!(combining.contains("e\u{301}"));
   }
 }

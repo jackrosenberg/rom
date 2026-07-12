@@ -1,5 +1,5 @@
 use std::{
-  io,
+  io::{self, Write},
   process::{Child, ExitStatus},
   sync::atomic::Ordering,
   thread,
@@ -8,78 +8,238 @@ use std::{
 
 use crossterm::{
   cursor,
-  event::{self, KeyCode, KeyEvent, KeyModifiers},
+  event::{self, KeyCode, KeyModifiers},
   execute,
-  terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+  queue,
+  style::{Attribute, Print, SetAttribute},
+  terminal::{
+    self,
+    BeginSynchronizedUpdate,
+    Clear,
+    ClearType,
+    EndSynchronizedUpdate,
+  },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
 
 use super::{
   DEPENDENCY_POPULATE_BUDGET_PER_FRAME,
   MonitorOutcome,
   MonitorShared,
   WrapperConfig,
-  display_config,
+  console_config,
   run_streaming_render_loop,
   snapshot_logs,
 };
 
+const MAX_STREAMED_LOG_RECORDS_PER_FRAME: usize = 32;
+
 struct TerminalSession {
-  terminal: Terminal<CrosstermBackend<io::Stderr>>,
+  stderr:          io::Stderr,
+  origin_y:        u16,
+  terminal_width:  u16,
+  terminal_height: u16,
+  previous:        Option<rom_core::tui::Screen>,
+}
+
+fn graph_region_height(terminal_height: u16) -> u16 {
+  if terminal_height == 0 {
+    return 0;
+  }
+  let maximum = terminal_height.saturating_sub(1).max(1);
+  terminal_height.div_ceil(3).max(4).min(maximum)
 }
 
 impl TerminalSession {
   fn enter() -> io::Result<Self> {
     let mut stderr = io::stderr();
-    crossterm::terminal::enable_raw_mode()?;
-    execute!(stderr, EnterAlternateScreen, cursor::Hide)?;
+    terminal::enable_raw_mode()?;
 
-    let backend = CrosstermBackend::new(stderr);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-    Ok(Self { terminal })
+    let entered = (|| {
+      let (terminal_width, terminal_height) = terminal::size()?;
+      // Reserve only one row initially. The first render grows the compact
+      // region to its actual content height without leaving a blank block.
+      let height = terminal_height.min(1);
+      let origin_y = terminal_height.saturating_sub(height);
+      execute!(
+        stderr,
+        BeginSynchronizedUpdate,
+        cursor::Hide,
+        Print("\r\n".repeat(usize::from(height.saturating_sub(1)))),
+        cursor::MoveTo(0, origin_y),
+        EndSynchronizedUpdate
+      )?;
+      Ok(Self {
+        stderr,
+        origin_y,
+        terminal_width,
+        terminal_height,
+        previous: None,
+      })
+    })();
+
+    if entered.is_err() {
+      let _ = execute!(
+        io::stderr(),
+        EndSynchronizedUpdate,
+        SetAttribute(Attribute::Reset),
+        cursor::Show
+      );
+      let _ = terminal::disable_raw_mode();
+    }
+    entered
+  }
+
+  fn invalidate(&mut self) {
+    self.previous = None;
   }
 
   fn draw(
     &mut self,
     state: &rom_core::state::RenderSnapshot,
-    logs: &rom_core::tui::TuiLogs,
+    logs: &[String],
+    new_logs: &[String],
     config: &rom_core::tui::TuiConfig,
-    view: &rom_core::tui::TuiView,
   ) -> io::Result<()> {
-    self.terminal.draw(|frame| {
-      rom_core::tui::draw_prepared(frame, state, logs, config, view);
-    })?;
+    let (width, terminal_height) = terminal::size()?;
+    let minimum_height = u16::try_from(
+      rom_core::tui::minimum_required_graph_rows_at_width(width, state),
+    )
+    .unwrap_or(u16::MAX);
+    let soft_height = graph_region_height(terminal_height)
+      .max(minimum_height)
+      .min(terminal_height);
+    let screen =
+      rom_core::tui::render_graph_screen(width, soft_height, state, config);
+    let height = screen.height();
+    let origin_y = terminal_height.saturating_sub(height);
+    let previous_height = self.previous.as_ref().map_or(
+      self.terminal_height.saturating_sub(self.origin_y),
+      |screen| screen.height(),
+    );
+    let terminal_resized =
+      width != self.terminal_width || terminal_height != self.terminal_height;
+    let region_resized = terminal_resized
+      || origin_y != self.origin_y
+      || self
+        .previous
+        .as_ref()
+        .is_some_and(|screen| screen.height() != height);
+
+    execute!(self.stderr, BeginSynchronizedUpdate)?;
+    let update_result: io::Result<()> = (|| {
+      if terminal_resized {
+        // Existing normal-screen rows may have been reflowed by the terminal,
+        // so their old cursor coordinates are no longer meaningful. Clearing
+        // individual retained rows would leave wrapped graph fragments behind.
+        queue!(self.stderr, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        if origin_y > 0 {
+          let log_tail = rom_core::tui::render_retained_log_tail(
+            width,
+            origin_y,
+            logs,
+            new_logs.len(),
+          );
+          for y in 0..log_tail.height() {
+            queue!(self.stderr, cursor::MoveTo(0, y))?;
+            log_tail.write_ansi_row(y, &mut self.stderr)?;
+          }
+        }
+        self.previous = None;
+      } else if region_resized {
+        self.clear_previous()?;
+        self.previous = None;
+      } else if !new_logs.is_empty() {
+        // The newline-driven scroll moves the old graph naturally. Keep it on
+        // screen during the burst, then repaint every graph row afterward.
+        self.previous = None;
+      }
+      if region_resized && !terminal_resized && height > previous_height {
+        queue!(
+          self.stderr,
+          cursor::MoveTo(0, terminal_height.saturating_sub(1)),
+          Print("\r\n".repeat(usize::from(height - previous_height)))
+        )?;
+      }
+      self.terminal_width = width;
+      self.terminal_height = terminal_height;
+      self.origin_y = origin_y;
+
+      for line in new_logs {
+        let rendered = rom_core::tui::render_streamed_log(width, line);
+        for y in 0..rendered.height() {
+          queue!(
+            self.stderr,
+            cursor::MoveTo(0, self.origin_y),
+            Clear(ClearType::CurrentLine)
+          )?;
+          rendered.write_ansi_row(y, &mut self.stderr)?;
+          // A newline at the physical bottom scrolls this row into normal
+          // terminal history, leaving the transient region anchored in place.
+          queue!(
+            self.stderr,
+            cursor::MoveTo(0, terminal_height.saturating_sub(1)),
+            Print("\r\n")
+          )?;
+        }
+      }
+
+      for y in 0..screen.height() {
+        let unchanged = self.previous.as_ref().is_some_and(|previous| {
+          previous.width() == screen.width() && previous.row(y) == screen.row(y)
+        });
+        if unchanged {
+          continue;
+        }
+        queue!(self.stderr, cursor::MoveTo(0, self.origin_y + y))?;
+        screen.write_ansi_row(y, &mut self.stderr)?;
+      }
+      queue!(
+        self.stderr,
+        cursor::MoveTo(0, terminal_height.saturating_sub(1))
+      )?;
+      self.stderr.flush()?;
+      self.previous = Some(screen);
+      Ok(())
+    })();
+    let end_result = execute!(self.stderr, EndSynchronizedUpdate);
+
+    update_result?;
+    end_result
+  }
+
+  fn clear_previous(&mut self) -> io::Result<()> {
+    let height = self.previous.as_ref().map_or(
+      self.terminal_height.saturating_sub(self.origin_y),
+      rom_core::tui::Screen::height,
+    );
+    for y in 0..height {
+      queue!(
+        self.stderr,
+        cursor::MoveTo(0, self.origin_y.saturating_add(y)),
+        Clear(ClearType::CurrentLine)
+      )?;
+    }
     Ok(())
   }
 }
 
 impl Drop for TerminalSession {
   fn drop(&mut self) {
-    let _ = crossterm::terminal::disable_raw_mode();
     let _ = execute!(
-      self.terminal.backend_mut(),
-      LeaveAlternateScreen,
-      cursor::Show
+      self.stderr,
+      BeginSynchronizedUpdate,
+      cursor::MoveTo(0, self.origin_y),
+      Clear(ClearType::FromCursorDown),
+      SetAttribute(Attribute::Reset),
+      cursor::Show,
+      EndSynchronizedUpdate
     );
+    let _ = terminal::disable_raw_mode();
   }
 }
 
 #[derive(Default)]
-struct TuiRuntime {
-  view:         rom_core::tui::TuiView,
-  frozen_state: Option<rom_core::state::RenderSnapshot>,
-  frozen_logs:  Vec<String>,
-  search_cache: Option<CachedLogSearch>,
-}
-
-#[derive(Clone)]
-struct CachedLogSearch {
-  query:    String,
-  log_len:  usize,
-  last_log: Option<String>,
-  search:   rom_core::tui::TuiLogSearch,
-}
+struct TuiRuntime;
 
 impl TuiRuntime {
   fn draw(
@@ -89,67 +249,21 @@ impl TuiRuntime {
     silent: bool,
     config: &rom_core::tui::TuiConfig,
   ) -> io::Result<()> {
-    if self.view.paused
-      && let Some(state) = &self.frozen_state
-    {
-      let state = state.clone();
-      let logs = self.prepared_logs(self.frozen_logs.clone());
-      return terminal.draw(&state, &logs, config, &self.view);
+    if shared.screen_dirty.swap(false, Ordering::AcqRel) {
+      terminal.invalidate();
     }
-
-    let state = {
-      let state = shared.state.lock().unwrap();
-      state.render_snapshot()
+    let new_logs = {
+      let mut logs = shared.log_store.lock().unwrap();
+      if silent {
+        logs.drain_pending();
+        Vec::new()
+      } else {
+        logs.drain_pending_up_to(MAX_STREAMED_LOG_RECORDS_PER_FRAME)
+      }
     };
-    let logs = snapshot_logs(shared, silent, Some(&self.view));
-    let logs = self.prepared_logs(logs);
-    terminal.draw(&state, &logs, config, &self.view)
-  }
-
-  fn prepared_logs(&mut self, logs: Vec<String>) -> rom_core::tui::TuiLogs {
-    if self.view.search_query.is_empty() {
-      return rom_core::tui::TuiLogs::plain(logs);
-    }
-
-    let log_len = logs.len();
-    let last_log = logs.last().cloned();
-    if let Some(cache) = &self.search_cache
-      && cache.query == self.view.search_query
-      && cache.log_len == log_len
-      && cache.last_log == last_log
-    {
-      return rom_core::tui::TuiLogs::searched(logs, cache.search.clone());
-    }
-
-    let search =
-      rom_core::tui::build_log_search(&logs, &self.view.search_query);
-    self.search_cache = Some(CachedLogSearch {
-      query: self.view.search_query.clone(),
-      log_len,
-      last_log,
-      search: search.clone(),
-    });
-    rom_core::tui::TuiLogs::searched(logs, search)
-  }
-
-  fn toggle_pause(&mut self, shared: &MonitorShared, silent: bool) {
-    if self.view.paused {
-      self.view.paused = false;
-      self.frozen_state = None;
-      self.frozen_logs.clear();
-      self.view.log_scroll = 0;
-      self.search_cache = None;
-      return;
-    }
-
-    let state = {
-      let state = shared.state.lock().unwrap();
-      state.render_snapshot()
-    };
-    let logs = snapshot_logs(shared, silent, None);
-    self.frozen_state = Some(state);
-    self.frozen_logs = logs;
-    self.view.paused = true;
+    let state = shared.state.lock().unwrap().render_snapshot();
+    let logs = snapshot_logs(shared, silent);
+    terminal.draw(&state, &logs, &new_logs, config)
   }
 }
 
@@ -163,16 +277,13 @@ pub(super) fn run_tui_render_loop(
   };
 
   let tui_config = rom_core::tui::TuiConfig {
-    display:        display_config(cfg, true),
-    log_line_limit: cfg.log_lines,
+    console: console_config(true),
   };
-  let mut runtime = TuiRuntime::default();
+  let mut runtime = TuiRuntime;
   let mut status: Option<ExitStatus> = None;
 
   loop {
-    if let Some(outcome) =
-      handle_tui_events(child, shared, cfg, &mut runtime, &mut status)?
-    {
+    if let Some(outcome) = handle_tui_events(child, &mut status)? {
       drop(terminal);
       return Ok(outcome);
     }
@@ -187,14 +298,16 @@ pub(super) fn run_tui_render_loop(
       .draw(&mut terminal, shared, cfg.silent, &tui_config)
       .map_err(rom_core::error::RomError::Io)?;
 
+    let logs_pending =
+      !cfg.silent && shared.log_store.lock().unwrap().has_pending();
     if status.is_some()
       && shared.stderr_done.load(Ordering::Acquire)
-      && !runtime.view.paused
+      && !logs_pending
     {
       break;
     }
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(50));
   }
 
   drop(terminal);
@@ -204,176 +317,22 @@ pub(super) fn run_tui_render_loop(
 
 fn handle_tui_events(
   child: &mut Child,
-  shared: &MonitorShared,
-  cfg: &WrapperConfig,
-  runtime: &mut TuiRuntime,
   status: &mut Option<ExitStatus>,
 ) -> eyre::Result<Option<MonitorOutcome>> {
   while event::poll(Duration::from_millis(0))
     .map_err(rom_core::error::RomError::Io)?
   {
     let event = event::read().map_err(rom_core::error::RomError::Io)?;
-    if let Some(key) = event.as_key_press_event()
-      && let Some(exit_code) =
-        handle_tui_key(key, child, shared, cfg, runtime, status)?
-    {
-      return Ok(Some(exit_code));
+    if let Some(key) = event.as_key_press_event() {
+      let cancel = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+        || matches!(key.code, KeyCode::Char('q' | 'Q'));
+      if cancel {
+        return cancel_child(child, status).map(Some);
+      }
     }
   }
-
   Ok(None)
-}
-
-fn handle_tui_key(
-  key: KeyEvent,
-  child: &mut Child,
-  shared: &MonitorShared,
-  cfg: &WrapperConfig,
-  runtime: &mut TuiRuntime,
-  status: &mut Option<ExitStatus>,
-) -> eyre::Result<Option<MonitorOutcome>> {
-  if key.modifiers.contains(KeyModifiers::CONTROL)
-    && matches!(key.code, KeyCode::Char('c' | 'C'))
-  {
-    return cancel_child(child, status).map(Some);
-  }
-
-  if matches!(key.code, KeyCode::Char('q' | 'Q')) {
-    return cancel_child(child, status).map(Some);
-  }
-
-  if matches!(key.code, KeyCode::Char(' '))
-    && !key
-      .modifiers
-      .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-  {
-    runtime.toggle_pause(shared, cfg.silent);
-    return Ok(None);
-  }
-
-  if runtime.view.search_active {
-    return handle_tui_search_key(key, runtime, child, status);
-  }
-
-  match key.code {
-    KeyCode::Char('/') => {
-      runtime.view.search_active = true;
-      runtime.view.log_scroll = 0;
-      Ok(None)
-    },
-    KeyCode::Esc => {
-      runtime.view.search_active = false;
-      runtime.view.search_query.clear();
-      runtime.view.log_scroll = 0;
-      runtime.search_cache = None;
-      Ok(None)
-    },
-    KeyCode::Char('w' | 'W') => {
-      runtime.view.log_wrap = !runtime.view.log_wrap;
-      Ok(None)
-    },
-    KeyCode::Up | KeyCode::Char('k' | 'K') => {
-      scroll_logs_up(runtime, 1);
-      Ok(None)
-    },
-    KeyCode::Down | KeyCode::Char('j' | 'J') => {
-      scroll_logs_down(runtime, 1);
-      Ok(None)
-    },
-    KeyCode::PageUp => {
-      scroll_logs_up(runtime, 10);
-      Ok(None)
-    },
-    KeyCode::PageDown => {
-      scroll_logs_down(runtime, 10);
-      Ok(None)
-    },
-    KeyCode::Home => {
-      runtime.view.log_scroll = usize::MAX;
-      Ok(None)
-    },
-    KeyCode::End => {
-      runtime.view.log_scroll = 0;
-      Ok(None)
-    },
-    _ => Ok(None),
-  }
-}
-
-fn handle_tui_search_key(
-  key: KeyEvent,
-  runtime: &mut TuiRuntime,
-  child: &mut Child,
-  status: &mut Option<ExitStatus>,
-) -> eyre::Result<Option<MonitorOutcome>> {
-  match key.code {
-    KeyCode::Esc | KeyCode::Enter => {
-      runtime.view.search_active = false;
-      Ok(None)
-    },
-    KeyCode::Backspace => {
-      runtime.view.search_query.pop();
-      runtime.view.log_scroll = 0;
-      runtime.search_cache = None;
-      Ok(None)
-    },
-    KeyCode::Char('u' | 'U')
-      if key.modifiers.contains(KeyModifiers::CONTROL) =>
-    {
-      runtime.view.search_query.clear();
-      runtime.view.log_scroll = 0;
-      runtime.search_cache = None;
-      Ok(None)
-    },
-    KeyCode::Up => {
-      scroll_logs_up(runtime, 1);
-      Ok(None)
-    },
-    KeyCode::Down => {
-      scroll_logs_down(runtime, 1);
-      Ok(None)
-    },
-    KeyCode::PageUp => {
-      scroll_logs_up(runtime, 10);
-      Ok(None)
-    },
-    KeyCode::PageDown => {
-      scroll_logs_down(runtime, 10);
-      Ok(None)
-    },
-    KeyCode::Home => {
-      runtime.view.log_scroll = usize::MAX;
-      Ok(None)
-    },
-    KeyCode::End => {
-      runtime.view.log_scroll = 0;
-      Ok(None)
-    },
-    KeyCode::Char(ch)
-      if !key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-    {
-      runtime.view.search_query.push(ch);
-      runtime.view.log_scroll = 0;
-      runtime.search_cache = None;
-      Ok(None)
-    },
-    KeyCode::Char('c' | 'C')
-      if key.modifiers.contains(KeyModifiers::CONTROL) =>
-    {
-      cancel_child(child, status).map(Some)
-    },
-    _ => Ok(None),
-  }
-}
-
-fn scroll_logs_up(runtime: &mut TuiRuntime, amount: usize) {
-  runtime.view.log_scroll = runtime.view.log_scroll.saturating_add(amount);
-}
-
-fn scroll_logs_down(runtime: &mut TuiRuntime, amount: usize) {
-  runtime.view.log_scroll = runtime.view.log_scroll.saturating_sub(amount);
 }
 
 fn cancel_child(
@@ -383,13 +342,11 @@ fn cancel_child(
   if let Some(status) = status.as_ref() {
     return Ok(MonitorOutcome::Completed(status.code().unwrap_or(1)));
   }
-
   if let Some(done) = child.try_wait().map_err(rom_core::error::RomError::Io)? {
     let exit_code = done.code().unwrap_or(1);
     *status = Some(done);
     return Ok(MonitorOutcome::Completed(exit_code));
   }
-
   child.kill().map_err(rom_core::error::RomError::Io)?;
   let killed = child.wait().map_err(rom_core::error::RomError::Io)?;
   *status = Some(killed);
@@ -402,5 +359,19 @@ fn populate_pending_dependencies(shared: &MonitorShared) {
   if graph.populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME) {
     let now = rom_core::state::current_time();
     rom_core::update::maintain_state(&mut state, now);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::graph_region_height;
+
+  #[test]
+  fn graph_region_targets_one_third_without_exceeding_terminal() {
+    assert_eq!(graph_region_height(24), 8);
+    assert_eq!(graph_region_height(25), 9);
+    assert_eq!(graph_region_height(6), 4);
+    assert_eq!(graph_region_height(2), 1);
+    assert_eq!(graph_region_height(0), 0);
   }
 }

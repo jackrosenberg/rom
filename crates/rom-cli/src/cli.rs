@@ -18,11 +18,7 @@ use std::{
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::log_store::{
-  DEFAULT_TUI_LOG_LINE_LIMIT,
-  LogStore,
-  post_tui_failure_error_lines,
-};
+use crate::log_store::{LogStore, post_tui_failure_error_lines};
 
 pub(super) const DEPENDENCY_POPULATE_BUDGET_PER_FRAME: usize = 1;
 
@@ -51,33 +47,13 @@ pub struct Cli {
   #[command(subcommand)]
   pub command: Option<Commands>,
 
-  /// Parse JSON output from nix --log-format=internal-json
-  #[arg(long, global = true)]
-  pub json: bool,
-
   /// Minimal output
   #[arg(long, global = true)]
   pub silent: bool,
 
-  /// Output format: tree, plain, dashboard
-  #[arg(long, global = true, default_value = "tree")]
-  pub format: String,
-
-  /// Legend display style: compact, table, verbose
-  #[arg(long, global = true, default_value = "table")]
-  pub legend: String,
-
-  /// Summary display style: concise, table, full
-  #[arg(long, global = true, default_value = "concise")]
-  pub summary: String,
-
   /// Log prefix style: short, full, none
   #[arg(long, global = true, default_value = "short")]
   pub log_prefix: String,
-
-  /// Maximum number of log lines to display
-  #[arg(long, global = true)]
-  pub log_lines: Option<usize>,
 
   /// Nix-family evaluator to use. Auto-detected by default
   #[arg(long, global = true)]
@@ -126,11 +102,7 @@ pub(super) struct WrapperConfig {
   platform:         cognos::Platform,
   silent:           bool,
   verbose:          u8,
-  format:           rom_core::types::DisplayFormat,
-  legend_style:     rom_core::types::LegendStyle,
-  summary_style:    rom_core::types::SummaryStyle,
   log_prefix_style: rom_core::types::LogPrefixStyle,
-  log_lines:        Option<usize>,
 }
 
 /// Run the CLI application
@@ -153,16 +125,10 @@ pub fn run() -> eyre::Result<()> {
     .with_writer(std::io::stderr)
     .init();
 
-  // Pre-parse typed display values before any moves of cli
-  let format: rom_core::types::DisplayFormat = cli.format.parse()?;
-  let legend_style: rom_core::types::LegendStyle = cli.legend.parse()?;
-  let summary_style: rom_core::types::SummaryStyle = cli.summary.parse()?;
   let log_prefix_style: rom_core::types::LogPrefixStyle =
     cli.log_prefix.parse()?;
-  let log_lines = cli.log_lines;
   let silent = cli.silent;
   let verbose = cli.verbose;
-  let json = cli.json;
   let platform = cli
     .platform
     .as_deref()
@@ -180,30 +146,11 @@ pub fn run() -> eyre::Result<()> {
     })
     .unwrap_or_else(|| "rom".to_string());
 
-  let make_config = |input_mode: rom_core::types::InputMode| {
-    rom_core::types::Config {
-      piping: false,
-      silent,
-      input_mode,
-      show_timers: true,
-      width: None,
-      format,
-      legend_style,
-      summary_style,
-      log_prefix_style,
-      log_line_limit: log_lines,
-    }
-  };
-
   let cfg = WrapperConfig {
     platform,
     silent,
     verbose,
-    format,
-    legend_style,
-    summary_style,
     log_prefix_style,
-    log_lines,
   };
 
   match (&program_name[..], cli.command) {
@@ -231,15 +178,6 @@ pub fn run() -> eyre::Result<()> {
         nix_flags,
       }),
     ) => {
-      if packages.is_empty() && json {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        return Ok(rom_core::monitor_stream(
-          make_config(rom_core::types::InputMode::Json),
-          stdin.lock(),
-          stdout.lock(),
-        )?);
-      }
       if packages.is_empty() {
         eyre::bail!(
           "No package or flake specified for build\nUsage: rom build \
@@ -259,15 +197,6 @@ pub fn run() -> eyre::Result<()> {
         nix_flags,
       }),
     ) => {
-      if packages.is_empty() && json {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        return Ok(rom_core::monitor_stream(
-          make_config(rom_core::types::InputMode::Json),
-          stdin.lock(),
-          stdout.lock(),
-        )?);
-      }
       if packages.is_empty() {
         eyre::bail!(
           "No package or flake specified for shell\nUsage: rom shell \
@@ -287,15 +216,6 @@ pub fn run() -> eyre::Result<()> {
         nix_flags,
       }),
     ) => {
-      if packages.is_empty() && json {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        return Ok(rom_core::monitor_stream(
-          make_config(rom_core::types::InputMode::Json),
-          stdin.lock(),
-          stdout.lock(),
-        )?);
-      }
       if packages.is_empty() {
         eyre::bail!(
           "No package or flake specified for develop\nUsage: rom develop \
@@ -307,20 +227,11 @@ pub fn run() -> eyre::Result<()> {
       Ok(())
     },
 
-    // Direct piping mode, read from stdin
     (_, None) => {
-      let input_mode = if json {
-        rom_core::types::InputMode::Json
-      } else {
-        rom_core::types::InputMode::Human
-      };
-      let stdin = io::stdin();
-      let stdout = io::stdout();
-      Ok(rom_core::monitor_stream(
-        make_config(input_mode),
-        stdin.lock(),
-        stdout.lock(),
-      )?)
+      eyre::bail!(
+        "No command specified\nUsage: rom <build|shell|develop> <package> [-- \
+         <flags>]"
+      )
     },
   }
 }
@@ -475,18 +386,18 @@ pub(super) struct MonitorShared {
   pub(super) state:        Arc<Mutex<rom_core::state::State>>,
   pub(super) graph:        Arc<Mutex<rom_core::graph::GraphIndexer>>,
   pub(super) log_store:    Arc<Mutex<LogStore>>,
-  pub(super) stdout_lines: Arc<Mutex<Vec<String>>>,
   pub(super) stderr_done:  Arc<AtomicBool>,
+  pub(super) screen_dirty: Arc<AtomicBool>,
 }
 
 impl MonitorShared {
-  fn new(log_line_limit: Option<usize>) -> Self {
+  fn new() -> Self {
     Self {
       state:        Arc::new(Mutex::new(rom_core::state::State::new())),
       graph:        Arc::new(Mutex::new(rom_core::graph::GraphIndexer::new())),
-      log_store:    Arc::new(Mutex::new(LogStore::new(log_line_limit))),
-      stdout_lines: Arc::new(Mutex::new(Vec::new())),
+      log_store:    Arc::new(Mutex::new(LogStore::new())),
       stderr_done:  Arc::new(AtomicBool::new(false)),
+      screen_dirty: Arc::new(AtomicBool::new(false)),
     }
   }
 }
@@ -505,27 +416,37 @@ fn run_monitored_command(
 
   let stderr = child.stderr.take().expect("Failed to capture stderr");
   let stdout = child.stdout.take().expect("Failed to capture stdout");
-  let use_tui = io::stderr().is_terminal();
-  let log_line_limit = if use_tui {
-    cfg.log_lines.or(Some(DEFAULT_TUI_LOG_LINE_LIMIT))
-  } else {
-    cfg.log_lines
-  };
-
-  let shared = MonitorShared::new(log_line_limit);
+  let use_tui = io::stdin().is_terminal() && io::stderr().is_terminal();
+  let shared = MonitorShared::new();
   let stderr_thread = spawn_stderr_reader(stderr, &shared, cfg, use_tui);
-  let stdout_thread = spawn_stdout_reader(stdout, &shared);
+  let stdout_thread = spawn_stdout_reader(stdout, shared.screen_dirty.clone());
 
   let outcome = if use_tui {
-    tui_runtime::run_tui_render_loop(&mut child, &shared, cfg)?
+    tui_runtime::run_tui_render_loop(&mut child, &shared, cfg)
   } else {
-    run_streaming_render_loop(&mut child, &shared, cfg)?
+    run_streaming_render_loop(&mut child, &shared, cfg)
   };
 
-  let _ = stderr_thread.join();
-  let _ = stdout_thread.join();
-  flush_stdout_lines(&shared).map_err(rom_core::error::RomError::Io)?;
-  finish_monitored_command(&shared, cfg, outcome, use_tui)?;
+  // A monitor failure must not detach a still-running evaluator or its pipe
+  // readers. Reap the child before joining the workers on every exit path.
+  if outcome.is_err() {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+
+  let stderr_result = stderr_thread
+    .join()
+    .map_err(|_| eyre::eyre!("stderr reader thread panicked"));
+  let stdout_result = stdout_thread
+    .join()
+    .map_err(|_| eyre::eyre!("stdout reader thread panicked"));
+
+  let outcome = outcome?;
+  stderr_result?.map_err(rom_core::error::RomError::Io)?;
+  stdout_result?.map_err(rom_core::error::RomError::Io)?;
+  // Live TUI logs now remain in normal scrollback, so replaying selected
+  // failure lines after teardown would print parsed stderr records twice.
+  finish_monitored_command(&shared, cfg, outcome, false)?;
 
   Ok(outcome.exit_code())
 }
@@ -535,7 +456,7 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
   shared: &MonitorShared,
   cfg: &WrapperConfig,
   preserve_log_ansi: bool,
-) -> thread::JoinHandle<()> {
+) -> thread::JoinHandle<io::Result<()>> {
   let state = shared.state.clone();
   let graph = shared.graph.clone();
   let log_store = shared.log_store.clone();
@@ -545,12 +466,23 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
 
   thread::spawn(move || {
     use tracing::debug;
+
+    struct MarkDone(Arc<AtomicBool>);
+
+    impl Drop for MarkDone {
+      fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+      }
+    }
+
+    let _mark_done = MarkDone(stderr_done);
     let reader = BufReader::new(stderr);
     let mut json_count = 0;
     let mut non_json_count = 0;
     let mut log_prefixes = HashMap::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    for line in reader.lines() {
+      let line = line?;
       if let Some(json_line) = line.strip_prefix("@nix ") {
         json_count += 1;
         if let Ok(action) = serde_json::from_str::<cognos::Actions>(json_line) {
@@ -623,6 +555,7 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
           }
         } else {
           debug!("Failed to parse JSON: {}", json_line);
+          push_log(&log_store, line);
         }
       } else {
         non_json_count += 1;
@@ -634,30 +567,29 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
       "Stderr thread finished: {} JSON messages, {} non-JSON lines",
       json_count, non_json_count
     );
-    stderr_done.store(true, Ordering::Release);
+    Ok(())
   })
 }
 
 fn spawn_stdout_reader<R: Read + Send + 'static>(
-  stdout: R,
-  shared: &MonitorShared,
-) -> thread::JoinHandle<()> {
-  let stdout_lines = shared.stdout_lines.clone();
+  mut child_stdout: R,
+  screen_dirty: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<()>> {
   thread::spawn(move || {
-    let reader = BufReader::new(stdout);
-    for line in reader.lines().map_while(Result::ok) {
-      stdout_lines.lock().unwrap().push(line);
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let mut buffer = [0_u8; 8192];
+    loop {
+      let read = child_stdout.read(&mut buffer)?;
+      if read == 0 {
+        break;
+      }
+      stdout.write_all(&buffer[..read])?;
+      stdout.flush()?;
+      screen_dirty.store(true, Ordering::Release);
     }
+    Ok(())
   })
-}
-
-fn flush_stdout_lines(shared: &MonitorShared) -> io::Result<()> {
-  let stdout_lines = shared.stdout_lines.lock().unwrap();
-  let mut stdout = io::stdout().lock();
-  for line in stdout_lines.iter() {
-    writeln!(stdout, "{line}")?;
-  }
-  stdout.flush()
 }
 
 fn build_log_line(action: &cognos::Actions) -> Option<(cognos::Id, &str)> {
@@ -772,28 +704,20 @@ fn push_log(log_store: &Arc<Mutex<LogStore>>, line: String) {
 pub(super) fn snapshot_logs(
   shared: &MonitorShared,
   silent: bool,
-  view: Option<&rom_core::tui::TuiView>,
 ) -> Vec<String> {
   if silent {
     Vec::new()
   } else {
-    shared.log_store.lock().unwrap().snapshot(view)
+    shared.log_store.lock().unwrap().snapshot()
   }
 }
 
-pub(super) fn display_config(
-  cfg: &WrapperConfig,
+pub(super) fn console_config(
   use_color: bool,
-) -> rom_core::display::DisplayConfig {
-  rom_core::display::DisplayConfig {
-    show_timers: true,
-    max_tree_depth: 10,
-    max_visible_lines: 100,
+) -> rom_core::console::ConsoleConfig {
+  rom_core::console::ConsoleConfig {
     use_color,
-    format: cfg.format,
-    legend_style: cfg.legend_style,
-    summary_style: cfg.summary_style,
-    icons: rom_core::icons::detect(),
+    ..rom_core::console::ConsoleConfig::default()
   }
 }
 
@@ -807,39 +731,46 @@ pub(super) fn run_streaming_render_loop(
   let log_store = shared.log_store.clone();
   let stderr_done = shared.stderr_done.clone();
   let silent = cfg.silent;
-  let display_config = display_config(cfg, true);
 
-  let render_thread = thread::spawn(move || {
-    use rom_core::display::Display;
-
-    let mut display = Display::new(io::stderr(), display_config).unwrap();
-
+  // Redirected stderr must be append-only: stream each log once and leave the
+  // stable summary to `render_final_after_monitor`.
+  let render_thread = thread::spawn(move || -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
     loop {
-      thread::sleep(Duration::from_millis(100));
       let done = stderr_done.load(Ordering::Acquire);
-      let mut state = render_state.lock().unwrap();
-      let mut graph = render_graph.lock().unwrap();
-      if graph
-        .populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME)
       {
-        let now = rom_core::state::current_time();
-        rom_core::update::maintain_state(&mut state, now);
+        let mut state = render_state.lock().unwrap();
+        let mut graph = render_graph.lock().unwrap();
+        if graph
+          .populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME)
+        {
+          let now = rom_core::state::current_time();
+          rom_core::update::maintain_state(&mut state, now);
+        }
       }
-      let logs: Vec<String> = if silent {
-        Vec::new()
-      } else {
-        log_store.lock().unwrap().snapshot(None)
-      };
-      let _ = display.render(&state, &logs);
+
+      let lines = log_store.lock().unwrap().drain_pending();
+      if !silent && !lines.is_empty() {
+        for line in lines {
+          writeln!(stderr, "{line}")?;
+        }
+        stderr.flush()?;
+      }
 
       if done {
         break;
       }
+      thread::sleep(Duration::from_millis(25));
     }
+    Ok(())
   });
 
   let status = child.wait().map_err(rom_core::error::RomError::Io)?;
-  let _ = render_thread.join();
+  render_thread
+    .join()
+    .map_err(|_| eyre::eyre!("stderr render thread panicked"))?
+    .map_err(rom_core::error::RomError::Io)?;
   Ok(MonitorOutcome::Completed(status.code().unwrap_or(1)))
 }
 
@@ -866,7 +797,7 @@ fn finish_monitored_command(
 fn finish_monitor_state(shared: &MonitorShared) {
   let mut state = shared.state.lock().unwrap();
   let mut graph = shared.graph.lock().unwrap();
-  if graph.populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME) {
+  if graph.drain_pending(&mut state, Duration::from_secs(2)) {
     let now = rom_core::state::current_time();
     rom_core::update::maintain_state(&mut state, now);
   }
@@ -875,22 +806,19 @@ fn finish_monitor_state(shared: &MonitorShared) {
 
 fn render_final_after_monitor(
   shared: &MonitorShared,
-  cfg: &WrapperConfig,
+  _cfg: &WrapperConfig,
   exit_code: i32,
   show_failure_errors: bool,
 ) -> eyre::Result<()> {
-  use rom_core::display::Display;
-
   let state = shared.state.lock().unwrap();
-  let mut display = Display::new(
+  rom_core::console::write_final_graph(
     io::stderr(),
-    display_config(cfg, io::stderr().is_terminal()),
-  )?;
-  display
-    .render_final(&state)
-    .map_err(rom_core::error::RomError::Io)?;
+    &state,
+    console_config(io::stderr().is_terminal()),
+  )
+  .map_err(rom_core::error::RomError::Io)?;
   if show_failure_errors && exit_code != 0 {
-    let logs = shared.log_store.lock().unwrap().snapshot(None);
+    let logs = shared.log_store.lock().unwrap().snapshot();
     write_post_tui_failure_errors(io::stderr(), &state, &logs)
       .map_err(rom_core::error::RomError::Io)?;
   }

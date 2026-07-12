@@ -2,7 +2,7 @@
 
 Visual build monitor for Nix that transforms cryptic build logs into a clean,
 real-time dependency graph. Think of it as `NOM`, but written in Rust with a
-focus on speed, configurability, and showing you exactly what Nix is doing with
+focus on speed and showing you exactly what Nix is doing with
 your builds.
 
 Built with a modular parser under [`crates/cognos`](crates/cognos) that handles
@@ -34,11 +34,7 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-      --json                     Parse JSON output from nix --log-format=internal-json
       --silent                   Minimal output
-      --format <FORMAT>          Output format: tree, plain, dashboard [default: tree]
-      --legend <LEGEND>          Legend display style: compact, table, verbose [default: table]
-      --summary <SUMMARY>        Summary display style: concise, table, full [default: concise]
       --log-prefix <LOG_PREFIX>  Log prefix style: short, full, none [default: short]
       --log-lines <LOG_LINES>    Maximum number of log lines to display
       --platform <PLATFORM>      Nix-family evaluator to use. Auto-detected by default
@@ -53,15 +49,14 @@ To build a package with Nix, let's say `pkgs.hello`, you can do:
 
 ```terminal
 $ rom build nixpkgs#hello
-┏━ Dependency Graph:
-┃ ⏵ hello-2.12.2 (configurePhase) ⏱ 2s
-┣━━━ Builds
-┗━ ∑ ⏵ 1 │ ✔ 0 │ ✗ 0 │ ⏸ 4 │ ⏱ 2s
+⢄ Evaluating flake.nix 1 file
+└─⢄ hello-2.12.2 configurePhase
+  Building 1 │ Waiting 4 │ 2s
 ```
 
-and the dependency tree will appear below. Each package in your closure appears
-as a node, with spinners and timers showing real-time progress. When a build
-finishes, you'll see a clear status with neat little glyphs.
+and the live operations console will appear below the build logs. Each active
+package appears as a node, with status, phase, and timing information. The final
+graph is retained after the command exits.
 
 ### Argument Passthrough
 
@@ -93,9 +88,8 @@ _rum_. I like rum. However you may choose to name it "rusty output monitor" or
 
 This project is clearly inspired by the famous
 <https://github.com/maralorn/nix-output-monitor>. I am a huge fan of NOM's
-design, but I am a little disappointed by its lack of configurability. This is a
-more flexible replacement that makes both my life, and displaying build graphs
-easier.
+design, and built ROM as a fast Rust implementation centered on a compact operations
+console.
 
 The ATerm and internal-json log parser was inspired, and mostly copied from
 <https://git.atagen.co/atagen/nous> with consolidation, cleaner repo layout, and

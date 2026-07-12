@@ -1,11 +1,4 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ProgressState {
-  JustStarted,
-  InputReceived,
-  Finished,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OutputName {
   Out,
   Doc,
