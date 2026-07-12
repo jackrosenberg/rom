@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use cognos::{Actions, Activities, OutputName, Verbosity};
+use cognos::{Actions, Activities, OutputName, ResultType, Verbosity};
 use rom_core::{
   state::{
     BuildInfo,
@@ -136,6 +136,51 @@ fn transfer_changes_refresh_derivation_and_parent_summaries() {
       .dependency_summary
       .running_downloads
       .is_empty()
+  );
+}
+
+#[test]
+fn child_activity_progress_updates_live_and_completed_cache_transfer() {
+  let mut state = State::new();
+  let path = "/nix/store/cccccccc-output";
+  let path_id =
+    state.get_or_create_store_path_id(StorePath::parse(path).unwrap());
+
+  assert!(process_message(&mut state, Actions::Start {
+    id:       42,
+    level:    Verbosity::Info,
+    parent:   0,
+    text:     format!("copying path '{path}'"),
+    activity: Activities::Substitute,
+    fields:   vec![serde_json::json!(path), serde_json::json!("cache.test")],
+  }));
+  assert!(process_message(&mut state, Actions::Start {
+    id:       43,
+    level:    Verbosity::Info,
+    parent:   42,
+    text:     "downloading".to_string(),
+    activity: Activities::FileTransfer,
+    fields:   vec![serde_json::json!("https://cache.test/nar")],
+  }));
+  assert!(process_message(&mut state, Actions::Result {
+    id:          43,
+    result_type: ResultType::Progress,
+    fields:      vec![
+      serde_json::json!(768),
+      serde_json::json!(1024),
+      serde_json::json!(1),
+      serde_json::json!(0),
+    ],
+  }));
+
+  let running = &state.full_summary.running_downloads[&path_id];
+  assert_eq!(running.bytes_transferred, 768);
+  assert_eq!(running.total_bytes, Some(1024));
+
+  assert!(process_message(&mut state, Actions::Stop { id: 42 }));
+  assert_eq!(
+    state.full_summary.completed_downloads[&path_id].total_bytes,
+    768
   );
 }
 

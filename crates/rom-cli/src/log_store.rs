@@ -1,12 +1,27 @@
-use std::collections::VecDeque;
+use std::{
+  collections::VecDeque,
+  sync::{Condvar, Mutex},
+};
 
 pub const DEFAULT_TUI_LOG_LINE_LIMIT: usize = 20_000;
 pub const POST_TUI_ERROR_LINE_LIMIT: usize = 60;
+const MAX_PENDING_LOG_RECORDS: usize = 1_024;
 
 #[derive(Default)]
-pub struct LogStore {
+struct LogStoreState {
   lines:   VecDeque<String>,
   pending: VecDeque<String>,
+  closed:  bool,
+}
+
+/// Bounded hand-off between the stderr parser and renderer.
+///
+/// Back-pressure is intentional: it preserves every record without allowing a
+/// fast evaluator to grow a second, unbounded copy of the log in memory.
+#[derive(Default)]
+pub struct LogStore {
+  state: Mutex<LogStoreState>,
+  space: Condvar,
 }
 
 impl LogStore {
@@ -14,32 +29,51 @@ impl LogStore {
     Self::default()
   }
 
-  pub fn push(&mut self, line: String) {
-    self.pending.push_back(line.clone());
-    self.lines.push_back(line);
-    if self.lines.len() > DEFAULT_TUI_LOG_LINE_LIMIT {
-      self.lines.pop_front();
+  pub fn push(&self, line: String) {
+    let mut state = self.state.lock().unwrap();
+    while state.pending.len() >= MAX_PENDING_LOG_RECORDS && !state.closed {
+      state = self.space.wait(state).unwrap();
+    }
+    if state.closed {
+      return;
+    }
+    state.pending.push_back(line.clone());
+    state.lines.push_back(line);
+    if state.lines.len() > DEFAULT_TUI_LOG_LINE_LIMIT {
+      state.lines.pop_front();
     }
   }
 
+  /// Release a producer if rendering has terminated unexpectedly.
+  pub fn close(&self) {
+    self.state.lock().unwrap().closed = true;
+    self.space.notify_all();
+  }
+
   /// Drain parsed lines that have not yet been streamed to the terminal.
-  pub fn drain_pending(&mut self) -> Vec<String> {
-    self.pending.drain(..).collect()
+  pub fn drain_pending(&self) -> Vec<String> {
+    let mut state = self.state.lock().unwrap();
+    let drained = state.pending.drain(..).collect();
+    self.space.notify_all();
+    drained
   }
 
   /// Drain at most `limit` pending records so a log burst cannot starve the
   /// live graph renderer for an entire frame.
-  pub fn drain_pending_up_to(&mut self, limit: usize) -> Vec<String> {
-    let count = limit.min(self.pending.len());
-    self.pending.drain(..count).collect()
+  pub fn drain_pending_up_to(&self, limit: usize) -> Vec<String> {
+    let mut state = self.state.lock().unwrap();
+    let count = limit.min(state.pending.len());
+    let drained = state.pending.drain(..count).collect();
+    self.space.notify_all();
+    drained
   }
 
   pub fn has_pending(&self) -> bool {
-    !self.pending.is_empty()
+    !self.state.lock().unwrap().pending.is_empty()
   }
 
   pub fn snapshot(&self) -> Vec<String> {
-    self.lines.iter().cloned().collect()
+    self.state.lock().unwrap().lines.iter().cloned().collect()
   }
 }
 
@@ -236,7 +270,7 @@ mod tests {
 
   #[test]
   fn pending_delivery_is_exactly_once_despite_retention_eviction() {
-    let mut store = LogStore::new();
+    let store = LogStore::new();
     store.push("zero".to_string());
     store.push("one".to_string());
 
@@ -247,5 +281,30 @@ mod tests {
     assert!(!store.has_pending());
     assert!(store.drain_pending().is_empty());
     assert_eq!(store.snapshot(), ["zero", "one"]);
+  }
+
+  #[test]
+  fn pending_queue_applies_backpressure_and_delivers_every_record() {
+    let store = std::sync::Arc::new(LogStore::new());
+    let producer_store = store.clone();
+    let producer = std::thread::spawn(move || {
+      for index in 0..MAX_PENDING_LOG_RECORDS + 17 {
+        producer_store.push(index.to_string());
+      }
+    });
+
+    let mut received = Vec::new();
+    while received.len() < MAX_PENDING_LOG_RECORDS + 17 {
+      received.extend(store.drain_pending_up_to(31));
+      std::thread::yield_now();
+    }
+    producer.join().unwrap();
+
+    assert_eq!(received.len(), MAX_PENDING_LOG_RECORDS + 17);
+    assert_eq!(received.first().unwrap(), "0");
+    assert_eq!(
+      received.last().unwrap(),
+      &(MAX_PENDING_LOG_RECORDS + 16).to_string()
+    );
   }
 }

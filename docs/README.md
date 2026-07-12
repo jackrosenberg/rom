@@ -36,7 +36,6 @@ Commands:
 Options:
       --silent                   Minimal output
       --log-prefix <LOG_PREFIX>  Log prefix style: short, full, none [default: short]
-      --log-lines <LOG_LINES>    Maximum number of log lines to display
       --platform <PLATFORM>      Nix-family evaluator to use. Auto-detected by default
   -v...                          Increase verbosity; controls nix log level and rom diagnostic output. Repeatable: -v (info), -vv (debug), -vvv (trace)
   -h, --help                     Print help
@@ -49,8 +48,7 @@ To build a package with Nix, let's say `pkgs.hello`, you can do:
 
 ```terminal
 $ rom build nixpkgs#hello
-⢄ Evaluating flake.nix 1 file
-└─⢄ hello-2.12.2 configurePhase
+⢄ Building hello-2.12.2  configurePhase  2s
   Building 1 │ Waiting 4 │ 2s
 ```
 

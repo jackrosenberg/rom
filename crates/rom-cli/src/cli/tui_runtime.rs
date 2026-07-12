@@ -1,7 +1,7 @@
 use std::{
   io::{self, Write},
   process::{Child, ExitStatus},
-  sync::atomic::Ordering,
+  sync::{atomic::Ordering, mpsc::Receiver},
   thread,
   time::Duration,
 };
@@ -35,9 +35,12 @@ const MAX_STREAMED_LOG_RECORDS_PER_FRAME: usize = 32;
 
 struct TerminalSession {
   stderr:          io::Stderr,
+  stdout:          io::Stdout,
+  stdout_is_tty:   bool,
   origin_y:        u16,
   terminal_width:  u16,
   terminal_height: u16,
+  scroll_bottom:   Option<u16>,
   previous:        Option<rom_core::tui::Screen>,
 }
 
@@ -49,8 +52,14 @@ fn graph_region_height(terminal_height: u16) -> u16 {
   terminal_height.div_ceil(3).max(4).min(maximum)
 }
 
+fn graph_height_budget(terminal_height: u16, mandatory_height: u16) -> u16 {
+  graph_region_height(terminal_height)
+    .max(mandatory_height)
+    .min(terminal_height.saturating_sub(1))
+}
+
 impl TerminalSession {
-  fn enter() -> io::Result<Self> {
+  fn enter(stdout_is_tty: bool) -> io::Result<Self> {
     let mut stderr = io::stderr();
     terminal::enable_raw_mode()?;
 
@@ -70,9 +79,12 @@ impl TerminalSession {
       )?;
       Ok(Self {
         stderr,
+        stdout: io::stdout(),
+        stdout_is_tty,
         origin_y,
         terminal_width,
         terminal_height,
+        scroll_bottom: None,
         previous: None,
       })
     })();
@@ -93,6 +105,33 @@ impl TerminalSession {
     self.previous = None;
   }
 
+  /// Write child stdout while no graph update can race it. On a terminal the
+  /// scrolling margin keeps exact child bytes above the transient graph; when
+  /// redirected, the bytes are written unchanged to the redirected stream.
+  fn write_child_stdout(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
+    if chunks.is_empty() {
+      return Ok(());
+    }
+    execute!(self.stderr, BeginSynchronizedUpdate)?;
+    if self.stdout_is_tty {
+      let scroll_bottom = self.origin_y.max(1);
+      if self.scroll_bottom != Some(scroll_bottom) {
+        queue!(
+          self.stderr,
+          Print(format!("\x1b[1;{scroll_bottom}r")),
+          cursor::MoveTo(0, scroll_bottom.saturating_sub(1))
+        )?;
+        self.scroll_bottom = Some(scroll_bottom);
+      }
+      self.stderr.flush()?;
+    }
+    for chunk in chunks {
+      self.stdout.write_all(chunk)?;
+    }
+    self.stdout.flush()?;
+    execute!(self.stderr, EndSynchronizedUpdate)
+  }
+
   fn draw(
     &mut self,
     state: &rom_core::state::RenderSnapshot,
@@ -105,9 +144,9 @@ impl TerminalSession {
       rom_core::tui::minimum_required_graph_rows_at_width(width, state),
     )
     .unwrap_or(u16::MAX);
-    let soft_height = graph_region_height(terminal_height)
-      .max(minimum_height)
-      .min(terminal_height);
+    // Keep at least one physical row outside the graph. Mandatory graph rows
+    // are clipped to this budget rather than taking away the streaming region.
+    let soft_height = graph_height_budget(terminal_height, minimum_height);
     let screen =
       rom_core::tui::render_graph_screen(width, soft_height, state, config);
     let height = screen.height();
@@ -164,12 +203,23 @@ impl TerminalSession {
       self.terminal_height = terminal_height;
       self.origin_y = origin_y;
 
+      let scroll_bottom = self.origin_y.max(1);
+      if self.scroll_bottom != Some(scroll_bottom) {
+        queue!(
+          self.stderr,
+          Print(format!("\x1b[1;{scroll_bottom}r")),
+          cursor::MoveTo(0, scroll_bottom.saturating_sub(1))
+        )?;
+        self.scroll_bottom = Some(scroll_bottom);
+      }
+      queue!(self.stderr, cursor::SavePosition)?;
+
       for line in new_logs {
         let rendered = rom_core::tui::render_streamed_log(width, line);
         for y in 0..rendered.height() {
           queue!(
             self.stderr,
-            cursor::MoveTo(0, self.origin_y),
+            cursor::MoveTo(0, scroll_bottom.saturating_sub(1)),
             Clear(ClearType::CurrentLine)
           )?;
           rendered.write_ansi_row(y, &mut self.stderr)?;
@@ -177,7 +227,7 @@ impl TerminalSession {
           // terminal history, leaving the transient region anchored in place.
           queue!(
             self.stderr,
-            cursor::MoveTo(0, terminal_height.saturating_sub(1)),
+            cursor::MoveTo(0, scroll_bottom.saturating_sub(1)),
             Print("\r\n")
           )?;
         }
@@ -193,10 +243,7 @@ impl TerminalSession {
         queue!(self.stderr, cursor::MoveTo(0, self.origin_y + y))?;
         screen.write_ansi_row(y, &mut self.stderr)?;
       }
-      queue!(
-        self.stderr,
-        cursor::MoveTo(0, terminal_height.saturating_sub(1))
-      )?;
+      queue!(self.stderr, cursor::RestorePosition)?;
       self.stderr.flush()?;
       self.previous = Some(screen);
       Ok(())
@@ -231,6 +278,7 @@ impl Drop for TerminalSession {
       cursor::MoveTo(0, self.origin_y),
       Clear(ClearType::FromCursorDown),
       SetAttribute(Attribute::Reset),
+      Print("\x1b[r"),
       cursor::Show,
       EndSynchronizedUpdate
     );
@@ -247,18 +295,22 @@ impl TuiRuntime {
     terminal: &mut TerminalSession,
     shared: &MonitorShared,
     silent: bool,
+    flush_all_logs: bool,
     config: &rom_core::tui::TuiConfig,
   ) -> io::Result<()> {
     if shared.screen_dirty.swap(false, Ordering::AcqRel) {
       terminal.invalidate();
     }
     let new_logs = {
-      let mut logs = shared.log_store.lock().unwrap();
       if silent {
-        logs.drain_pending();
+        shared.log_store.drain_pending();
         Vec::new()
+      } else if flush_all_logs {
+        shared.log_store.drain_pending()
       } else {
-        logs.drain_pending_up_to(MAX_STREAMED_LOG_RECORDS_PER_FRAME)
+        shared
+          .log_store
+          .drain_pending_up_to(MAX_STREAMED_LOG_RECORDS_PER_FRAME)
       }
     };
     let state = shared.state.lock().unwrap().render_snapshot();
@@ -271,9 +323,25 @@ pub(super) fn run_tui_render_loop(
   child: &mut Child,
   shared: &MonitorShared,
   cfg: &WrapperConfig,
+  stdout_receiver: Receiver<Vec<u8>>,
+  stdout_is_tty: bool,
 ) -> eyre::Result<MonitorOutcome> {
-  let Ok(mut terminal) = TerminalSession::enter() else {
-    return run_streaming_render_loop(child, shared, cfg);
+  let Ok(mut terminal) = TerminalSession::enter(stdout_is_tty) else {
+    let relay = thread::spawn(move || -> io::Result<()> {
+      let stdout = io::stdout();
+      let mut stdout = stdout.lock();
+      for chunk in stdout_receiver {
+        stdout.write_all(&chunk)?;
+        stdout.flush()?;
+      }
+      Ok(())
+    });
+    let outcome = run_streaming_render_loop(child, shared, cfg);
+    relay
+      .join()
+      .map_err(|_| eyre::eyre!("stdout relay thread panicked"))?
+      .map_err(rom_core::error::RomError::Io)?;
+    return outcome;
   };
 
   let tui_config = rom_core::tui::TuiConfig {
@@ -281,11 +349,16 @@ pub(super) fn run_tui_render_loop(
   };
   let mut runtime = TuiRuntime;
   let mut status: Option<ExitStatus> = None;
+  let mut requested_outcome = None;
 
   loop {
-    if let Some(outcome) = handle_tui_events(child, &mut status)? {
-      drop(terminal);
-      return Ok(outcome);
+    if requested_outcome.is_none()
+      && let Some(outcome) = handle_tui_events(child, &mut status)?
+    {
+      // Keep rendering until both pipe readers have delivered their bounded
+      // queues. Cancellation must not turn already-produced records into a
+      // best-effort stream.
+      requested_outcome = Some(outcome);
     }
 
     if status.is_none() {
@@ -294,16 +367,25 @@ pub(super) fn run_tui_render_loop(
 
     populate_pending_dependencies(shared);
 
-    runtime
-      .draw(&mut terminal, shared, cfg.silent, &tui_config)
+    let stdout_chunks = stdout_receiver.try_iter().collect::<Vec<_>>();
+    terminal
+      .write_child_stdout(&stdout_chunks)
       .map_err(rom_core::error::RomError::Io)?;
 
-    let logs_pending =
-      !cfg.silent && shared.log_store.lock().unwrap().has_pending();
-    if status.is_some()
-      && shared.stderr_done.load(Ordering::Acquire)
-      && !logs_pending
-    {
+    let readers_done = shared.stderr_done.load(Ordering::Acquire)
+      && shared.stdout_done.load(Ordering::Acquire);
+    runtime
+      .draw(
+        &mut terminal,
+        shared,
+        cfg.silent,
+        status.is_some(),
+        &tui_config,
+      )
+      .map_err(rom_core::error::RomError::Io)?;
+
+    let logs_pending = !cfg.silent && shared.log_store.has_pending();
+    if status.is_some() && readers_done && !logs_pending {
       break;
     }
 
@@ -311,6 +393,9 @@ pub(super) fn run_tui_render_loop(
   }
 
   drop(terminal);
+  if let Some(outcome) = requested_outcome {
+    return Ok(outcome);
+  }
   let exit_code = status.and_then(|status| status.code()).unwrap_or(1);
   Ok(MonitorOutcome::Completed(exit_code))
 }
@@ -361,7 +446,7 @@ fn populate_pending_dependencies(shared: &MonitorShared) {
 
 #[cfg(test)]
 mod tests {
-  use super::graph_region_height;
+  use super::{graph_height_budget, graph_region_height};
 
   #[test]
   fn graph_region_targets_one_third_without_exceeding_terminal() {
@@ -370,5 +455,12 @@ mod tests {
     assert_eq!(graph_region_height(6), 4);
     assert_eq!(graph_region_height(2), 1);
     assert_eq!(graph_region_height(0), 0);
+  }
+
+  #[test]
+  fn mandatory_graph_rows_are_clipped_to_reserve_streaming_space() {
+    assert_eq!(graph_height_budget(24, 100), 23);
+    assert_eq!(graph_height_budget(2, 100), 1);
+    assert_eq!(graph_height_budget(1, 100), 0);
   }
 }

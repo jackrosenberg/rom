@@ -221,6 +221,75 @@ fn render_snapshot_keeps_visible_activity_phases_only() {
 }
 
 #[test]
+fn summary_propagation_handles_deep_shared_and_cyclic_graphs() {
+  let mut state = State::new();
+  let ids = (0..2_500)
+    .map(|index| {
+      state.get_or_create_derivation_id(
+        Derivation::parse(&format!("/nix/store/hash-node-{index}.drv"))
+          .unwrap(),
+      )
+    })
+    .collect::<Vec<_>>();
+
+  for edge in ids.windows(2) {
+    connect(&mut state, edge[0], edge[1]);
+  }
+  // The extra edge exercises shared-descendant de-duplication.
+  connect(&mut state, ids[100], ids[2_499]);
+
+  state.update_build_status(ids[2_499], BuildStatus::Planned);
+
+  assert!(
+    state
+      .get_derivation_info(ids[0])
+      .unwrap()
+      .dependency_summary
+      .planned_builds
+      .contains(&ids[2_499])
+  );
+
+  let mut cyclic = State::new();
+  let a = cyclic.get_or_create_derivation_id(
+    Derivation::parse("/nix/store/hash-cycle-a.drv").unwrap(),
+  );
+  let b = cyclic.get_or_create_derivation_id(
+    Derivation::parse("/nix/store/hash-cycle-b.drv").unwrap(),
+  );
+  let c = cyclic.get_or_create_derivation_id(
+    Derivation::parse("/nix/store/hash-cycle-c.drv").unwrap(),
+  );
+  connect(&mut cyclic, a, b);
+  connect(&mut cyclic, b, c);
+  connect(&mut cyclic, c, a);
+  cyclic.update_build_status(c, BuildStatus::Planned);
+  let once = cyclic
+    .get_derivation_info(a)
+    .unwrap()
+    .dependency_summary
+    .clone();
+  cyclic.update_build_status(c, BuildStatus::Planned);
+  let twice = &cyclic.get_derivation_info(a).unwrap().dependency_summary;
+  assert_eq!(once.planned_builds, twice.planned_builds);
+}
+
+fn connect(state: &mut State, parent: usize, child: usize) {
+  state
+    .get_derivation_info_mut(parent)
+    .unwrap()
+    .input_derivations
+    .push(InputDerivation {
+      derivation: child,
+      outputs:    std::collections::HashSet::new(),
+    });
+  state
+    .get_derivation_info_mut(child)
+    .unwrap()
+    .derivation_parents
+    .insert(parent);
+}
+
+#[test]
 fn planned_derivation_dependencies_are_populated_incrementally() {
   let dir = tempfile::tempdir().unwrap();
   let leaf_path =

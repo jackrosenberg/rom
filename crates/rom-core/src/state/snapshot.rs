@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::{
+  cmp::Reverse,
+  collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+};
 
 use cognos::{Host, OutputName};
 use indexmap::IndexMap;
@@ -223,13 +226,13 @@ impl State {
     // breadth-first up to the normal snapshot cap.
     let mut snapshot_ids = render_ids.clone();
     let mut queued = snapshot_ids.clone();
-    let mut candidates = VecDeque::new();
+    let mut candidates = BinaryHeap::new();
     for drv_id in &render_ids {
       self.queue_render_children(*drv_id, &mut queued, &mut candidates);
     }
 
     while snapshot_ids.len() < MAX_RENDER_SNAPSHOT_DERIVATIONS {
-      let Some(drv_id) = candidates.pop_front() else {
+      let Some(Reverse((_, drv_id))) = candidates.pop() else {
         break;
       };
       snapshot_ids.insert(drv_id);
@@ -274,7 +277,9 @@ impl State {
     &self,
     drv_id: DerivationId,
     queued: &mut HashSet<DerivationId>,
-    candidates: &mut VecDeque<DerivationId>,
+    candidates: &mut BinaryHeap<
+      Reverse<(crate::update::BuildSortKey, DerivationId)>,
+    >,
   ) {
     let Some(info) = self.derivation_infos.get(&drv_id) else {
       return;
@@ -282,7 +287,8 @@ impl State {
     for child_id in info.input_derivations.iter().map(|input| input.derivation)
     {
       if queued.insert(child_id) {
-        candidates.push_back(child_id);
+        candidates
+          .push(Reverse((crate::update::sort_key(self, child_id), child_id)));
       }
     }
   }
@@ -464,4 +470,69 @@ fn derivation_name_index(
 fn dedup_derivation_ids(ids: &mut Vec<DerivationId>) {
   let mut seen = HashSet::new();
   ids.retain(|id| seen.insert(*id));
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{collections::HashSet, path::PathBuf};
+
+  use cognos::Host;
+
+  use super::*;
+  use crate::state::{BuildInfo, BuildStatus, InputDerivation};
+
+  fn derivation(name: &str) -> Derivation {
+    Derivation {
+      path: PathBuf::from(format!("/nix/store/hash-{name}.drv")),
+      name: name.to_string(),
+    }
+  }
+
+  #[test]
+  fn snapshot_ranks_more_than_cap_candidates_before_truncating() {
+    let mut state = State::new();
+    let root = state.get_or_create_derivation_id(derivation("root"));
+    state.forest_roots.push(root);
+    let mut children = Vec::new();
+    for index in 0..(MAX_RENDER_SNAPSHOT_DERIVATIONS + 32) {
+      let child = state
+        .get_or_create_derivation_id(derivation(&format!("child-{index}")));
+      children.push(child);
+      state
+        .get_derivation_info_mut(root)
+        .unwrap()
+        .input_derivations
+        .push(InputDerivation {
+          derivation: child,
+          outputs:    HashSet::new(),
+        });
+      state
+        .get_derivation_info_mut(child)
+        .unwrap()
+        .derivation_parents
+        .insert(root);
+    }
+    let preferred = *children.last().unwrap();
+    state.update_build_status(preferred, BuildStatus::Built {
+      info: BuildInfo {
+        start:       1.0,
+        host:        Host::Localhost,
+        activity_id: None,
+      },
+      end:  2.0,
+    });
+
+    let snapshot = state.render_snapshot();
+
+    assert_eq!(
+      snapshot.derivation_infos.len(),
+      MAX_RENDER_SNAPSHOT_DERIVATIONS
+    );
+    assert!(snapshot.derivation_infos.contains_key(&preferred));
+    assert!(
+      !snapshot
+        .derivation_infos
+        .contains_key(&children[MAX_RENDER_SNAPSHOT_DERIVATIONS - 1])
+    );
+  }
 }

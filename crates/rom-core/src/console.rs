@@ -24,12 +24,21 @@ impl Default for ConsoleConfig {
 /// Format a duration in seconds for console status text.
 #[must_use]
 pub fn format_duration(secs: f64) -> String {
-  if secs < 60.0 {
-    format!("{secs:.0}s")
-  } else if secs < 3600.0 {
-    format!("{:.0}m{:.0}s", secs / 60.0, secs % 60.0)
+  let total_seconds = if secs.is_finite() {
+    secs.max(0.0).round() as u64
   } else {
-    format!("{:.0}h{:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0)
+    0
+  };
+  if total_seconds < 60 {
+    format!("{total_seconds}s")
+  } else if total_seconds < 3_600 {
+    format!("{}m{}s", total_seconds / 60, total_seconds % 60)
+  } else {
+    format!(
+      "{}h{}m",
+      total_seconds / 3_600,
+      (total_seconds % 3_600) / 60
+    )
   }
 }
 
@@ -113,5 +122,20 @@ fn colored(text: &str, ansi_color: &str, enabled: bool) -> String {
     format!("\x1b[38;5;{ansi_color}m{text}\x1b[0m")
   } else {
     text.to_string()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::format_duration;
+
+  #[test]
+  fn duration_rounds_once_before_splitting_components() {
+    assert_eq!(format_duration(59.4), "59s");
+    assert_eq!(format_duration(59.5), "1m0s");
+    assert_eq!(format_duration(3_599.4), "59m59s");
+    assert_eq!(format_duration(3_599.5), "1h0m");
+    assert_eq!(format_duration(3_659.5), "1h1m");
+    assert_eq!(format_duration(-1.0), "0s");
   }
 }

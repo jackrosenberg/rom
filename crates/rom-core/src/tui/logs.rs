@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use super::screen::{
   Attribute,
   Color,
@@ -10,13 +8,17 @@ use super::screen::{
   terminal_text_height,
 };
 
-const MAX_RENDERED_LOG_LINE_CHARS: usize = 2_000;
+/// Hard source-character budget for one rendered log record. Both live and
+/// resize-retained rendering use this exact bound.
+const MAX_RENDERED_LOG_RECORD_CHARS: usize = 2_000;
+const TRUNCATED_LOG_MARKER: &str = "… [log truncated]";
 
 pub(super) fn render_streamed_log(width: u16, text: &str) -> Screen {
   if width == 0 {
     return Screen::new(0, 0);
   }
-  let lines = parse_ansi_text(text);
+  let text = safe_bounded_log_text(text);
+  let lines = parse_ansi_text(&text);
   let height = terminal_text_height(&lines, width).max(1);
   let mut screen = Screen::new(width, height);
   screen.draw_terminal_text(&lines);
@@ -61,7 +63,8 @@ pub(super) fn render_retained_log_tail(
 }
 
 fn parse_ansi_line(line: &str) -> Vec<Line> {
-  parse_ansi_text(bounded_log_line(line).as_ref())
+  let line = safe_bounded_log_text(line);
+  parse_ansi_text(&line)
 }
 
 fn parse_ansi_text(text: &str) -> Vec<Line> {
@@ -346,17 +349,108 @@ fn ansi_color(index: u8, bright: bool) -> Color {
   }
 }
 
-fn bounded_log_line(line: &str) -> Cow<'_, str> {
-  if line.chars().count() <= MAX_RENDERED_LOG_LINE_CHARS {
-    return Cow::Borrowed(line);
+fn safe_bounded_log_text(text: &str) -> String {
+  let marker_len = TRUNCATED_LOG_MARKER.chars().count();
+  let content_limit = MAX_RENDERED_LOG_RECORD_CHARS.saturating_sub(marker_len);
+  let mut chars = text.chars().take(content_limit + 1).collect::<Vec<_>>();
+  let truncated = chars.len() > content_limit;
+  chars.truncate(content_limit);
+
+  let mut safe = String::with_capacity(chars.len() + marker_len + 4);
+  let mut index = 0;
+  while index < chars.len() {
+    let ch = chars[index];
+    match ch {
+      '\n' => {
+        safe.push('\n');
+        index += 1;
+      },
+      '\r' => {
+        safe.push('\n');
+        index += usize::from(chars.get(index + 1) == Some(&'\n')) + 1;
+      },
+      '\x1b' => {
+        // Retain only complete CSI Select Graphic Rendition sequences. Every
+        // cursor, erase, OSC, DCS, and private escape is discarded.
+        if chars.get(index + 1) == Some(&'[') {
+          let mut end = index + 2;
+          while end < chars.len()
+            && end.saturating_sub(index) <= 64
+            && !chars[end].is_control()
+            && chars[end] != '\x1b'
+          {
+            if ('@'..='~').contains(&chars[end]) {
+              if chars[end] == 'm'
+                && chars[index + 2..end]
+                  .iter()
+                  .all(|value| (' '..='?').contains(value))
+              {
+                safe.extend(chars[index..=end].iter());
+              }
+              end += 1;
+              break;
+            }
+            end += 1;
+          }
+          index = end.max(index + 1);
+        } else if matches!(
+          chars.get(index + 1),
+          Some(']' | 'P' | 'X' | '^' | '_')
+        ) {
+          index += 2;
+          while index < chars.len() {
+            if chars[index] == '\x07' {
+              index += 1;
+              break;
+            }
+            if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'\\') {
+              index += 2;
+              break;
+            }
+            index += 1;
+          }
+        } else {
+          index = (index + 2).min(chars.len());
+        }
+      },
+      '\u{9b}' => {
+        index += 1;
+        while index < chars.len() {
+          let value = chars[index];
+          index += 1;
+          if ('@'..='~').contains(&value) {
+            break;
+          }
+        }
+      },
+      '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => {
+        index += 1;
+        while index < chars.len() {
+          if chars[index] == '\u{9c}' || chars[index] == '\x07' {
+            index += 1;
+            break;
+          }
+          index += 1;
+        }
+      },
+      // DEL and all remaining C0/C1 controls other than normalized line
+      // breaks are never emitted.
+      '\u{80}'..='\u{9f}' | '\u{7f}' | '\0'..='\u{1f}' => {
+        index += 1;
+      },
+      _ => {
+        safe.push(ch);
+        index += 1;
+      },
+    }
   }
 
-  let mut truncated = line
-    .chars()
-    .take(MAX_RENDERED_LOG_LINE_CHARS)
-    .collect::<String>();
-  truncated.push('…');
-  Cow::Owned(truncated)
+  if truncated {
+    // Reset retained SGR so the marker itself is always visible and explicit.
+    safe.push_str("\x1b[0m");
+    safe.push_str(TRUNCATED_LOG_MARKER);
+  }
+  safe
 }
 
 #[cfg(test)]
@@ -407,5 +501,41 @@ mod tests {
     assert_eq!(screen.row_text(0).as_deref(), Some("界界"));
     assert_eq!(screen.row_text(1).as_deref(), Some("x   "));
     assert!(!screen.plain_text().contains("2J"));
+  }
+
+  #[test]
+  fn log_rendering_removes_all_terminal_controls_but_keeps_sgr() {
+    let hostile = concat!(
+      "a\0\x07\x08\x0b\x0c\x7f",
+      "\u{0085}\u{009b}2J\u{009d}title\u{009c}",
+      "\x1b]2;title\x07\x1b[2J",
+      "\x1b[31mred\x1b[0m\r\nnext\rline"
+    );
+    let safe = safe_bounded_log_text(hostile);
+    let screen = render_streamed_log(40, hostile);
+
+    assert!(!safe.chars().any(|ch| {
+      (ch.is_control() && !matches!(ch, '\n' | '\x1b'))
+        || ('\u{80}'..='\u{9f}').contains(&ch)
+    }));
+    assert!(!safe.contains("2J"));
+    assert!(!safe.contains("title"));
+    assert!(safe.contains("\x1b[31mred\x1b[0m"));
+    assert_eq!(screen.height(), 3);
+    assert!(screen.plain_text().contains("ared"));
+    assert!(screen.plain_text().contains("next"));
+  }
+
+  #[test]
+  fn live_and_retained_logs_share_a_visible_hard_length_bound() {
+    let giant = "x".repeat(MAX_RENDERED_LOG_RECORD_CHARS * 100);
+    let live = render_streamed_log(100, &giant);
+    let retained = render_retained_log_tail(100, 25, &[giant], 0);
+
+    for screen in [&live, &retained] {
+      let text = screen.plain_text();
+      assert!(text.contains(TRUNCATED_LOG_MARKER));
+      assert!(screen.height() <= 25);
+    }
   }
 }

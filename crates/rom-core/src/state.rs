@@ -3,7 +3,8 @@ mod identity;
 mod snapshot;
 
 use std::{
-  collections::{HashMap, HashSet, VecDeque},
+  cmp::Reverse,
+  collections::{BinaryHeap, HashMap, HashSet},
   time::{Duration, SystemTime},
 };
 
@@ -541,49 +542,60 @@ impl State {
   /// Propagate a status change up the parent chain by recomputing each
   /// ancestor's dependency_summary.
   pub(crate) fn propagate_to_parents(&mut self, id: DerivationId) {
-    // Collect all ancestors first to avoid borrowing issues
-    let mut ancestors: Vec<DerivationId> = Vec::new();
-    let mut current_parents = self
-      .derivation_parents(id)
-      .into_iter()
-      .collect::<VecDeque<_>>();
-    let mut visited: HashSet<DerivationId> = HashSet::new();
-
-    while let Some(parent_id) = current_parents.pop_front() {
+    // Discover the affected induced subgraph once.
+    let mut ancestors = HashSet::new();
+    let mut visited = HashSet::from([id]);
+    let mut stack = self.derivation_parents(id);
+    while let Some(parent_id) = stack.pop() {
       if visited.insert(parent_id) {
-        ancestors.push(parent_id);
-        for grandparent_id in self.derivation_parents(parent_id) {
-          current_parents.push_back(grandparent_id);
+        ancestors.insert(parent_id);
+        stack.extend(self.derivation_parents(parent_id));
+      }
+    }
+
+    // Kahn's algorithm over reversed dependency edges gives deterministic
+    // child-before-parent processing in O(V + E), including shared children.
+    let mut remaining_children = HashMap::with_capacity(ancestors.len());
+    let mut ready = BinaryHeap::new();
+    for ancestor_id in &ancestors {
+      let count = self.get_derivation_info(*ancestor_id).map_or(0, |info| {
+        info
+          .input_derivations
+          .iter()
+          .filter(|input| ancestors.contains(&input.derivation))
+          .count()
+      });
+      remaining_children.insert(*ancestor_id, count);
+      if count == 0 {
+        ready.push(Reverse(*ancestor_id));
+      }
+    }
+
+    let mut processed = HashSet::with_capacity(ancestors.len());
+    while let Some(Reverse(ancestor_id)) = ready.pop() {
+      if !processed.insert(ancestor_id) {
+        continue;
+      }
+      self.recompute_derivation_summary(ancestor_id);
+      for parent_id in self.derivation_parents(ancestor_id) {
+        if let Some(count) = remaining_children.get_mut(&parent_id) {
+          *count = count.saturating_sub(1);
+          if *count == 0 {
+            ready.push(Reverse(parent_id));
+          }
         }
       }
     }
 
-    // Recompute bottom-up. A node can be both a direct parent and an ancestor
-    // through another branch, so BFS discovery order is not topological.
-    let mut pending = ancestors.into_iter().collect::<HashSet<_>>();
-    while !pending.is_empty() {
-      let mut ready = pending
-        .iter()
-        .copied()
-        .filter(|ancestor_id| {
-          self.get_derivation_info(*ancestor_id).is_none_or(|info| {
-            info
-              .input_derivations
-              .iter()
-              .all(|input| !pending.contains(&input.derivation))
-          })
-        })
-        .collect::<Vec<_>>();
-      if ready.is_empty() {
-        // Malformed cyclic graphs cannot be topologically ordered. Recompute
-        // deterministically once and terminate rather than looping forever.
-        ready.extend(pending.iter().copied());
-      }
-      ready.sort_unstable();
-      for ancestor_id in ready {
-        self.recompute_derivation_summary(ancestor_id);
-        pending.remove(&ancestor_id);
-      }
+    // Cyclic malformed input has no topological order. Recompute each residual
+    // node exactly once in stable ID order and terminate deterministically.
+    let mut cyclic = ancestors
+      .difference(&processed)
+      .copied()
+      .collect::<Vec<_>>();
+    cyclic.sort_unstable();
+    for ancestor_id in cyclic {
+      self.recompute_derivation_summary(ancestor_id);
     }
   }
 

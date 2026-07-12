@@ -389,24 +389,63 @@ fn handle_result(
       false
     },
     ResultType::Progress => {
-      if fields.len() >= 4
-        && let (Some(done), Some(expected), Some(running), Some(failed)) = (
-          fields[0].as_u64(),
-          fields[1].as_u64(),
-          fields[2].as_u64(),
-          fields[3].as_u64(),
-        )
-        && let Some(activity) = state.activities.get_mut(&id)
-      {
+      if fields.len() < 4 {
+        return false;
+      }
+      let (Some(done), Some(expected), Some(running), Some(failed)) = (
+        fields[0].as_u64(),
+        fields[1].as_u64(),
+        fields[2].as_u64(),
+        fields[3].as_u64(),
+      ) else {
+        return false;
+      };
+
+      let mut changed = false;
+      if let Some(activity) = state.activities.get_mut(&id) {
         activity.progress = Some(ActivityProgress {
           done,
           expected,
           running,
           failed,
         });
-        return true;
+        changed = true;
       }
-      false
+
+      // FileTransfer progress is commonly emitted by a child activity of the
+      // Substitute/CopyPath activity that owns the cache transfer.
+      let mut related_activity_ids = std::collections::HashSet::new();
+      let mut current = Some(id);
+      while let Some(activity_id) = current {
+        if !related_activity_ids.insert(activity_id) {
+          break;
+        }
+        current = state
+          .activities
+          .get(&activity_id)
+          .and_then(|activity| activity.parent);
+      }
+
+      let mut changed_paths = Vec::new();
+      for (path_id, transfer) in state
+        .full_summary
+        .running_downloads
+        .iter_mut()
+        .chain(state.full_summary.running_uploads.iter_mut())
+      {
+        if related_activity_ids.contains(&transfer.activity_id) {
+          transfer.bytes_transferred = done;
+          transfer.total_bytes = Some(expected);
+          changed_paths.push(*path_id);
+          changed = true;
+        }
+      }
+      changed_paths.sort_unstable();
+      changed_paths.dedup();
+      for path_id in changed_paths {
+        state.refresh_store_path_summary(path_id);
+      }
+      changed
     },
     ResultType::SetExpected => {
       if fields.len() >= 2 {

@@ -597,6 +597,7 @@ dependencies = [
  "eyre",
  "rom-cli",
  "rom-core",
+ "tempfile",
 ]
 
 [[package]]

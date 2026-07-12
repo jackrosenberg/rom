@@ -10,6 +10,7 @@ use std::{
     Arc,
     Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc::SyncSender,
   },
   thread,
   time::Duration,
@@ -385,8 +386,9 @@ fn run_develop_wrapper(
 pub(super) struct MonitorShared {
   pub(super) state:        Arc<Mutex<rom_core::state::State>>,
   pub(super) graph:        Arc<Mutex<rom_core::graph::GraphIndexer>>,
-  pub(super) log_store:    Arc<Mutex<LogStore>>,
+  pub(super) log_store:    Arc<LogStore>,
   pub(super) stderr_done:  Arc<AtomicBool>,
+  pub(super) stdout_done:  Arc<AtomicBool>,
   pub(super) screen_dirty: Arc<AtomicBool>,
 }
 
@@ -395,8 +397,9 @@ impl MonitorShared {
     Self {
       state:        Arc::new(Mutex::new(rom_core::state::State::new())),
       graph:        Arc::new(Mutex::new(rom_core::graph::GraphIndexer::new())),
-      log_store:    Arc::new(Mutex::new(LogStore::new())),
+      log_store:    Arc::new(LogStore::new()),
       stderr_done:  Arc::new(AtomicBool::new(false)),
+      stdout_done:  Arc::new(AtomicBool::new(false)),
       screen_dirty: Arc::new(AtomicBool::new(false)),
     }
   }
@@ -419,10 +422,31 @@ fn run_monitored_command(
   let use_tui = io::stdin().is_terminal() && io::stderr().is_terminal();
   let shared = MonitorShared::new();
   let stderr_thread = spawn_stderr_reader(stderr, &shared, cfg, use_tui);
-  let stdout_thread = spawn_stdout_reader(stdout, shared.screen_dirty.clone());
+  let (stdout_thread, stdout_receiver) = if use_tui {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    (
+      spawn_queued_stdout_reader(stdout, sender, shared.stdout_done.clone()),
+      Some(receiver),
+    )
+  } else {
+    (
+      spawn_stdout_reader(
+        stdout,
+        shared.screen_dirty.clone(),
+        shared.stdout_done.clone(),
+      ),
+      None,
+    )
+  };
 
-  let outcome = if use_tui {
-    tui_runtime::run_tui_render_loop(&mut child, &shared, cfg)
+  let outcome = if let Some(stdout_receiver) = stdout_receiver {
+    tui_runtime::run_tui_render_loop(
+      &mut child,
+      &shared,
+      cfg,
+      stdout_receiver,
+      io::stdout().is_terminal(),
+    )
   } else {
     run_streaming_render_loop(&mut child, &shared, cfg)
   };
@@ -433,6 +457,9 @@ fn run_monitored_command(
     let _ = child.kill();
     let _ = child.wait();
   }
+  // Cancellation or a rendering error can otherwise leave the parser blocked
+  // behind the bounded log hand-off while this thread waits to join it.
+  shared.log_store.close();
 
   let stderr_result = stderr_thread
     .join()
@@ -561,11 +588,46 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
   })
 }
 
+fn spawn_queued_stdout_reader<R: Read + Send + 'static>(
+  mut child_stdout: R,
+  sender: SyncSender<Vec<u8>>,
+  stdout_done: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<()>> {
+  thread::spawn(move || {
+    struct MarkDone(Arc<AtomicBool>);
+    impl Drop for MarkDone {
+      fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+      }
+    }
+    let _mark_done = MarkDone(stdout_done);
+    let mut buffer = [0_u8; 8192];
+    loop {
+      let read = child_stdout.read(&mut buffer)?;
+      if read == 0 {
+        break;
+      }
+      if sender.send(buffer[..read].to_vec()).is_err() {
+        break;
+      }
+    }
+    Ok(())
+  })
+}
+
 fn spawn_stdout_reader<R: Read + Send + 'static>(
   mut child_stdout: R,
   screen_dirty: Arc<AtomicBool>,
+  stdout_done: Arc<AtomicBool>,
 ) -> thread::JoinHandle<io::Result<()>> {
   thread::spawn(move || {
+    struct MarkDone(Arc<AtomicBool>);
+    impl Drop for MarkDone {
+      fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+      }
+    }
+    let _mark_done = MarkDone(stdout_done);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let mut buffer = [0_u8; 8192];
@@ -687,8 +749,8 @@ fn format_log_prefix(
   format!("{name}> ")
 }
 
-fn push_log(log_store: &Arc<Mutex<LogStore>>, line: String) {
-  log_store.lock().unwrap().push(line);
+fn push_log(log_store: &Arc<LogStore>, line: String) {
+  log_store.push(line);
 }
 
 pub(super) fn snapshot_logs(
@@ -698,7 +760,7 @@ pub(super) fn snapshot_logs(
   if silent {
     Vec::new()
   } else {
-    shared.log_store.lock().unwrap().snapshot()
+    shared.log_store.snapshot()
   }
 }
 
@@ -736,7 +798,7 @@ pub(super) fn run_streaming_render_loop(
           .populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME);
       }
 
-      let lines = log_store.lock().unwrap().drain_pending();
+      let lines = log_store.drain_pending();
       if !silent && !lines.is_empty() {
         for line in lines {
           writeln!(stderr, "{line}")?;
@@ -801,7 +863,7 @@ fn render_final_after_monitor(
   )
   .map_err(rom_core::error::RomError::Io)?;
   if show_failure_errors && exit_code != 0 {
-    let logs = shared.log_store.lock().unwrap().snapshot();
+    let logs = shared.log_store.snapshot();
     write_post_tui_failure_errors(io::stderr(), &state, &logs)
       .map_err(rom_core::error::RomError::Io)?;
   }

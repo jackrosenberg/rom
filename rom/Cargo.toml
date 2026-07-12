@@ -16,3 +16,6 @@ path = "src/lib.rs"
 rom-core.workspace = true
 rom-cli.workspace = true
 eyre.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
