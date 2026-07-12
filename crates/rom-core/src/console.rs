@@ -9,6 +9,11 @@ pub struct ConsoleConfig {
   pub max_tree_depth:    usize,
   pub max_visible_lines: usize,
   pub use_color:         bool,
+  /// Output width in terminal columns.
+  ///
+  /// The rendering seam deliberately does not inspect the process terminal so
+  /// callers can safely use it with files, sockets, and in-memory writers.
+  pub width:             u16,
 }
 
 impl Default for ConsoleConfig {
@@ -17,6 +22,7 @@ impl Default for ConsoleConfig {
       max_tree_depth:    10,
       max_visible_lines: 100,
       use_color:         true,
+      width:             100,
     }
   }
 }
@@ -48,9 +54,9 @@ pub fn write_final_graph<W: Write>(
   state: &State,
   config: ConsoleConfig,
 ) -> io::Result<()> {
-  let width = crossterm::terminal::size().map_or(100, |(width, _)| width);
   let tui_config = crate::tui::TuiConfig { console: config };
-  let screen = crate::tui::render_final_graph_screen(width, state, &tui_config);
+  let screen =
+    crate::tui::render_final_graph_screen(config.width, state, &tui_config);
   for y in 0..screen.height() {
     if config.use_color {
       screen.write_ansi_row_trimmed(y, &mut writer)?;

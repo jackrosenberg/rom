@@ -34,6 +34,7 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
+      --json                     Parse unprefixed Nix internal-json records from stdin
       --silent                   Minimal output
       --log-prefix <LOG_PREFIX>  Log prefix style: short, full, none [default: short]
       --platform <PLATFORM>      Nix-family evaluator to use. Auto-detected by default
@@ -55,6 +56,25 @@ $ rom build nixpkgs#hello
 and the live operations console will appear below the build logs. Each active
 package appears as a node, with status, phase, and timing information. The final
 graph is retained after the command exits.
+
+ROM can also monitor an existing stream. With no subcommand it reads standard
+input, preserves log output once, and appends the final operations graph:
+
+```sh
+nix build nixpkgs#hello 2>&1 | rom
+nix build nixpkgs#hello --log-format internal-json 2>&1 | rom --json
+```
+
+`@nix `-prefixed internal-json records are detected automatically; `--json`
+also accepts unprefixed records. Stream output is append-only, making this mode
+safe for redirection and library writers.
+
+### Library API
+
+The top-level `rom` crate re-exports the stream API from `rom-core`:
+`Config`, `InputMode`, `Monitor<W>`, `create_monitor`, and `monitor_stream`.
+Generic writers do not take terminal ownership; color and output width are
+selected through `Config`.
 
 ### Argument Passthrough
 

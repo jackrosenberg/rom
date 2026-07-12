@@ -1,10 +1,15 @@
 //! ROM - Rust Output Monitor
 pub use rom_core::{
+  Config,
+  InputMode,
+  Monitor,
   Result,
   RomError,
   console,
+  create_monitor,
   error,
   graph,
+  monitor_stream,
   state,
   tui,
   types,

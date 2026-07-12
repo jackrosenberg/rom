@@ -43,10 +43,19 @@ impl MonitorOutcome {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "rom", version, about = "ROM - A Nix build output monitor")]
+#[command(
+  name = "rom",
+  version,
+  about = "ROM - A Nix build output monitor",
+  after_help = "With no COMMAND, reads Nix output from standard input."
+)]
 pub struct Cli {
   #[command(subcommand)]
   pub command: Option<Commands>,
+
+  /// Parse unprefixed Nix internal-json records from stdin
+  #[arg(long, global = true)]
+  pub json: bool,
 
   /// Minimal output
   #[arg(long, global = true)]
@@ -229,10 +238,26 @@ pub fn run() -> eyre::Result<()> {
     },
 
     (_, None) => {
-      eyre::bail!(
-        "No command specified\nUsage: rom <build|shell|develop> <package> [-- \
-         <flags>]"
-      )
+      let stdin = io::stdin();
+      let stdout = io::stdout();
+      let use_color = stdout.is_terminal();
+      let width = if use_color {
+        crossterm::terminal::size().map_or(100, |(width, _)| width)
+      } else {
+        100
+      };
+      let config = rom_core::Config {
+        input_mode: if cli.json {
+          rom_core::InputMode::Json
+        } else {
+          rom_core::InputMode::Human
+        },
+        use_color,
+        width,
+        silent,
+      };
+      rom_core::monitor_stream(config, stdin.lock(), stdout.lock())?;
+      Ok(())
     },
   }
 }
@@ -769,6 +794,7 @@ pub(super) fn console_config(
 ) -> rom_core::console::ConsoleConfig {
   rom_core::console::ConsoleConfig {
     use_color,
+    width: crossterm::terminal::size().map_or(100, |(width, _)| width),
     ..rom_core::console::ConsoleConfig::default()
   }
 }
