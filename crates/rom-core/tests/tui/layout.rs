@@ -25,6 +25,15 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
   assert!(bottom_border.starts_with('└'), "{bottom_border:?}");
   assert!(bottom_border.contains('┴'), "{bottom_border:?}");
   assert!(bottom_border.contains("┤ ") && bottom_border.ends_with(" ┘"));
+  for y in 1..screen.height() {
+    for cell in screen.row(y).unwrap() {
+      assert_eq!(
+        cell.style,
+        Style::default(),
+        "colored table cell at row {y}"
+      );
+    }
+  }
   assert_eq!(screen.height(), 6);
 }
 
@@ -83,6 +92,11 @@ fn wide_graph_keeps_activity_metadata_inline() {
   assert!(
     row.contains("hello-1.0 · 4s"),
     "wide terminals should not push metadata to the right edge: {row:?}"
+  );
+  let footer = screen.row_text(1).expect("host header");
+  assert!(
+    footer.trim_end().chars().count() <= 80,
+    "table should keep a stable compact width: {footer:?}"
   );
 }
 
@@ -327,7 +341,15 @@ fn final_failure_uses_the_live_console_graph_renderer() {
   let rendered = screen.plain_text();
   assert!(rendered.contains("hello-1.0"), "{rendered}");
   assert!(rendered.contains("FAILED"), "{rendered}");
-  assert!(rendered.contains("│ 1              │"), "{rendered}");
+  let values = rendered
+    .lines()
+    .find(|line| line.contains("1 builds"))
+    .unwrap();
+  assert_eq!(
+    values.split('│').rev().nth(1).map(str::trim),
+    Some("1"),
+    "{rendered}"
+  );
   assert!(!rendered.contains("Dependency Graph"), "{rendered}");
 }
 

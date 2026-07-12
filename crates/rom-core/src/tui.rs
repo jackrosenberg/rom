@@ -25,11 +25,6 @@ use crate::{
   state::{RenderSnapshot, State, current_time},
 };
 
-const TEXT_PRIMARY: Color = Color::Rgb {
-  r: 224,
-  g: 241,
-  b: 247,
-};
 const TEXT_MUTED: Color = Color::Rgb {
   r: 122,
   g: 164,
@@ -238,8 +233,10 @@ fn draw_console_footer(
   screen.draw_text(0, y, screen.width(), height, &lines, false);
 }
 
+const CONNECTED_TABLE_MAX_WIDTH: usize = 80;
+
 fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
-  let width = width.max(1);
+  let width = width.clamp(1, CONNECTED_TABLE_MAX_WIDTH);
   let columns = FooterColumns::for_width(width);
   let (pulls, pushes) = cache_activity(state);
   let mut hosts = pulls
@@ -260,7 +257,6 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
     lines.push(table_row(
       &["—".to_string(), "—".to_string(), "—".to_string()],
       &columns.host_widths,
-      &[TEXT_MUTED; 3],
     ));
   } else {
     for host in hosts {
@@ -272,11 +268,7 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
         .get(&host)
         .map(|activity| transfer_cell(activity, columns.detail))
         .unwrap_or_else(|| "—".to_string());
-      lines.push(table_row(
-        &[host, pull, push],
-        &columns.host_widths,
-        [TEXT_PRIMARY, DOWNLOAD_BLUE, UPLOAD_PURPLE].as_ref(),
-      ));
+      lines.push(table_row(&[host, pull, push], &columns.host_widths));
     }
   }
 
@@ -302,13 +294,6 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
       summary.failed_builds.len().to_string(),
     ],
     &columns.build_widths,
-    &[
-      TEXT_PRIMARY,
-      MOSS_GREEN,
-      MUTED_YELLOW,
-      BUILT_GREEN,
-      MUTED_RED,
-    ],
   ));
   lines.push(table_bottom(
     width,
@@ -396,6 +381,7 @@ fn distribute_columns(
 }
 
 fn compact_footer_line(state: &RenderSnapshot, width: usize) -> Line {
+  let width = width.min(CONNECTED_TABLE_MAX_WIDTH);
   let summary = &state.full_summary;
   let total = summary
     .planned_builds
@@ -415,12 +401,7 @@ fn compact_footer_line(state: &RenderSnapshot, width: usize) -> Line {
   let content_width = width.saturating_sub(2 + display_width(&notch));
   let content = fit_text(&status, content_width);
   let rule = "─".repeat(content_width.saturating_sub(display_width(&content)));
-  Line::from(vec![
-    Span::styled("└─", hierarchy_style()),
-    Span::styled(content, Style::default().fg(TEXT_PRIMARY)),
-    Span::styled(rule, hierarchy_style()),
-    Span::styled(notch, hierarchy_style()),
-  ])
+  Line::from(format!("└─{content}{rule}{notch}"))
 }
 
 fn table_header(
@@ -429,41 +410,32 @@ fn table_header(
   widths: &[usize],
   right: &str,
 ) -> Line {
-  let mut spans = vec![Span::styled(left, hierarchy_style())];
+  let mut spans = vec![Span::raw(left)];
   for (index, (title, width)) in titles.iter().zip(widths).enumerate() {
     let label = fit_text(&format!(" {title} "), *width);
-    spans.push(Span::styled("─", hierarchy_style()));
-    spans.push(Span::styled(
-      label.clone(),
-      Style::default()
-        .fg(TEXT_PRIMARY)
-        .add_attribute(Attribute::Bold),
-    ));
-    spans.push(Span::styled(
+    spans.push(Span::raw("─"));
+    spans.push(Span::raw(label.clone()));
+    spans.push(Span::raw(
       "─".repeat(width.saturating_sub(display_width(&label))),
-      hierarchy_style(),
     ));
-    spans.push(Span::styled(
-      if index + 1 == titles.len() {
-        right
-      } else {
-        "┬"
-      },
-      hierarchy_style(),
-    ));
+    spans.push(Span::raw(if index + 1 == titles.len() {
+      right
+    } else {
+      "┬"
+    }));
   }
   Line::from(spans)
 }
 
-fn table_row(values: &[String], widths: &[usize], colors: &[Color]) -> Line {
-  let mut spans = vec![Span::styled("│", hierarchy_style())];
-  for ((value, width), color) in values.iter().zip(widths).zip(colors) {
+fn table_row(values: &[String], widths: &[usize]) -> Line {
+  let mut spans = vec![Span::raw("│")];
+  for (value, width) in values.iter().zip(widths) {
     let value = fit_text(value, *width);
     let padding = width.saturating_sub(display_width(&value));
-    spans.push(Span::styled(" ", hierarchy_style()));
-    spans.push(Span::styled(value, Style::default().fg(*color)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(value));
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", hierarchy_style()));
+    spans.push(Span::raw("│"));
   }
   Line::from(spans)
 }
@@ -479,11 +451,7 @@ fn table_bottom(width: usize, elapsed: &str, columns: &[usize]) -> Line {
     }
   }
   rule = fit_rule(&rule, rule_width);
-  Line::from(vec![
-    Span::styled("└", hierarchy_style()),
-    Span::styled(rule, hierarchy_style()),
-    Span::styled(notch, hierarchy_style()),
-  ])
+  Line::from(format!("└{rule}{notch}"))
 }
 
 fn fit_rule(rule: &str, width: usize) -> String {
@@ -494,12 +462,7 @@ fn fit_rule(rule: &str, width: usize) -> String {
 
 fn transfer_cell(activity: &CacheActivity, detail: bool) -> String {
   let paths = activity.active.saturating_add(activity.completed);
-  let path_progress = format!("{}/{}", activity.completed, paths);
-  let prefix = if detail {
-    format!("{paths} paths · {path_progress}")
-  } else {
-    format!("{paths} · {path_progress}")
-  };
+  let prefix = format!("{}/{}", activity.completed, paths);
   if !activity.has_unknown_size && activity.bytes_total > 0 {
     let percent = activity
       .bytes_done

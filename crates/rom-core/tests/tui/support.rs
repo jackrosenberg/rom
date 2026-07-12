@@ -22,6 +22,7 @@ pub(super) use rom_core::{
     Attribute,
     Color,
     Screen,
+    Style,
     TuiConfig,
     render_final_graph_screen,
     render_graph_screen,

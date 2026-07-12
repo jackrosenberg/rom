@@ -62,7 +62,7 @@ fn tui_renders_running_uploads_as_first_class_graph_activity() {
       .chars()
       .skip(push_column)
       .collect::<String>()
-      .contains("1 paths · 0/1"),
+      .contains("0/1"),
     "upload belongs in the PUSH cell: {cache_row:?}"
   );
 }
@@ -101,7 +101,7 @@ fn connected_footer_merges_pull_and_push_for_the_same_host() {
     .filter_map(|index| screen.row_text(index))
     .find(|row| row.contains("cache.example.org"))
     .expect("combined host row");
-  assert_eq!(row.matches("1 paths · 0/1").count(), 2, "{row}");
+  assert_eq!(row.matches("0/1").count(), 2, "{row}");
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn cache_sidecar_retains_completed_cache_activity() {
 
   let rendered = format!("{}", terminal.backend());
   assert!(rendered.contains("cache.nixos.org"), "{rendered}");
-  assert!(rendered.contains("1 paths · 1/1"), "{rendered}");
+  assert!(rendered.contains("1/1"), "{rendered}");
   assert!(rendered.contains("100%"), "{rendered}");
 }
 
@@ -346,7 +346,7 @@ fn tui_renders_running_downloads_inline_in_dependency_graph() {
     "running substitute should show transfer progress: {download_row:?}"
   );
   assert!(
-    rendered.contains("1 paths · 0/1"),
+    rendered.contains("0/1"),
     "download should still be counted in the cache table: {rendered}"
   );
   assert!(
