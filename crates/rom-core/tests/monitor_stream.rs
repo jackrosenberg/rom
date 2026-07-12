@@ -55,6 +55,7 @@ fn human_plan_and_build_are_preserved_and_rendered() {
   let mut monitor = create_monitor(Config::default(), Vec::new()).unwrap();
   monitor.process_stream(Cursor::new(&input)).unwrap();
   assert_eq!(monitor.state().derivation_infos.len(), 1);
+  assert_eq!(monitor.state().full_summary.completed_builds.len(), 1);
   let output = String::from_utf8(monitor.into_writer()).unwrap();
 
   assert_eq!(
@@ -62,10 +63,8 @@ fn human_plan_and_build_are_preserved_and_rendered() {
     1
   );
   assert_eq!(output.matches(&format!("building '{DRV}'...")).count(), 1);
-  assert!(
-    output.contains("┃Building 0 · Waiting 0 · Built 1"),
-    "{output}"
-  );
+  assert!(!output.contains("Building 0"), "{output}");
+  assert!(!output.contains("Waiting for Nix activity"), "{output}");
   assert!(output.contains("Finished at"));
 }
 

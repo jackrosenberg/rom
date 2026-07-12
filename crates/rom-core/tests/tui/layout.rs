@@ -290,10 +290,11 @@ fn final_failure_uses_the_live_console_graph_renderer() {
 }
 
 #[test]
-fn tui_shows_evaluation_progress_before_build_graph_exists() {
+fn tui_shows_only_elapsed_time_before_graph_activity_exists() {
   let backend = TestBackend::new(80, 16);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
+  state.start_time = current_time() - 3.0;
   state.evaluation_state.count = 42;
   state.evaluation_state.last_file_name = Some(
     "«nixpkgs»/pkgs/by-name/bc/bcachefs-tools/kernel-module.nix".to_string(),
@@ -305,22 +306,11 @@ fn tui_shows_evaluation_progress_before_build_graph_exists() {
     .unwrap();
 
   let rendered = format!("{}", terminal.backend());
-  assert!(
-    rendered.contains("Evaluating"),
-    "evaluation status should replace idle graph text: {rendered}"
-  );
-  assert!(
-    rendered.contains("bcachefs-tools/kernel-module.nix"),
-    "evaluation status should show the current file tail: {rendered}"
-  );
-  assert!(
-    rendered.contains("42 files"),
-    "evaluation status should show the evaluation count: {rendered}"
-  );
-  assert!(
-    !rendered.contains("Waiting for Nix activity"),
-    "evaluation should not look idle: {rendered}"
-  );
+  assert!(rendered.trim_end().ends_with('s'), "{rendered}");
+  assert!(!rendered.contains("Evaluating"), "{rendered}");
+  assert!(!rendered.contains("Waiting for Nix activity"), "{rendered}");
+  assert!(!rendered.contains("Building 0"), "{rendered}");
+  assert!(!rendered.contains('┌'), "{rendered}");
 }
 
 #[test]

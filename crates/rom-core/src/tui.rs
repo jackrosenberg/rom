@@ -69,7 +69,6 @@ const MUTED_YELLOW: Color = Color::Rgb {
   b: 76,
 };
 const SPINNER_FRAMES: &[&str] = &["⢄", "⢂", "⢁", "⡁", "⡈", "⡐", "⡠"];
-
 #[derive(Clone, Copy, Default)]
 pub struct TuiConfig {
   pub console: ConsoleConfig,
@@ -93,12 +92,22 @@ pub fn render_graph_screen(
   state: &RenderSnapshot,
   config: &TuiConfig,
 ) -> Screen {
+  render_graph_screen_inner(width, soft_height, state, config, true)
+}
+
+fn render_graph_screen_inner(
+  width: u16,
+  soft_height: u16,
+  state: &RenderSnapshot,
+  config: &TuiConfig,
+  show_wait_timer: bool,
+) -> Screen {
   if soft_height == 0 {
     return Screen::new(width, 0);
   }
   let footer_height = console_footer_height(width, soft_height, state);
   let graph_budget = soft_height.saturating_sub(footer_height);
-  let mut lines = render_activity_graph_lines(
+  let lines = render_activity_graph_lines(
     state,
     config.console,
     usize::from(graph_budget),
@@ -106,7 +115,22 @@ pub fn render_graph_screen(
   )
   .lines;
   if lines.is_empty() {
-    lines.push(idle_graph_line(state, usize::from(width)));
+    if !show_wait_timer {
+      return Screen::new(width, 0);
+    }
+    let mut screen = Screen::new(width, 1);
+    screen.draw_text(
+      0,
+      0,
+      width,
+      1,
+      &[Line::from(Span::styled(
+        format_duration(current_time() - state.start_time),
+        secondary_style(),
+      ))],
+      false,
+    );
+    return screen;
   }
   let graph_height =
     graph_budget.min(u16::try_from(lines.len()).unwrap_or(u16::MAX));
@@ -136,7 +160,7 @@ pub fn render_final_graph_screen(
     optional_rows.max(minimum_required_graph_rows_at_width(width, &snapshot)),
   )
   .unwrap_or(u16::MAX);
-  render_graph_screen(width, soft_height, &snapshot, config)
+  render_graph_screen_inner(width, soft_height, &snapshot, config, false)
 }
 
 /// Parse one stored log record into safe, styled terminal rows.
@@ -156,83 +180,9 @@ pub fn render_retained_log_tail(
   logs::render_retained_log_tail(width, height, logs, excluded_tail)
 }
 
-fn idle_graph_line(state: &RenderSnapshot, width: usize) -> Line {
-  if let Some(line) = evaluation_graph_line(state, width) {
-    return line;
-  }
-
-  Line::from(Span::styled(
-    "Waiting for Nix activity...",
-    secondary_style(),
-  ))
-}
-
-fn evaluation_graph_line(state: &RenderSnapshot, width: usize) -> Option<Line> {
-  let eval = &state.evaluation_state;
-  if eval.count == 0 && eval.last_file_name.is_none() {
-    return None;
-  }
-
-  let count_label = if eval.count == 1 {
-    "1 file".to_string()
-  } else {
-    format!("{} files", eval.count)
-  };
-  let name_budget = width
-    .saturating_sub(" Evaluating ".len() + count_label.len() + 4)
-    .clamp(12, 72);
-  let file = eval.last_file_name.as_deref().map_or_else(
-    || "Nix expression".to_string(),
-    |path| compact_eval_path(path, name_budget),
-  );
-
-  Some(Line::from(vec![
-    Span::styled(
-      spinner_frame(current_time()),
-      Style::default().fg(MUTED_YELLOW),
-    ),
-    Span::raw(" "),
-    Span::styled("Evaluating", Style::default().fg(TEXT_PRIMARY)),
-    Span::raw(" "),
-    Span::styled(file, secondary_style()),
-    Span::raw(" "),
-    Span::styled(count_label, secondary_style()),
-  ]))
-}
-
-fn spinner_frame(now: f64) -> &'static str {
+pub(super) fn spinner_frame(now: f64) -> &'static str {
   let frame = ((now * 1000.0) as usize / 80) % SPINNER_FRAMES.len();
   SPINNER_FRAMES[frame]
-}
-
-fn compact_eval_path(path: &str, max_chars: usize) -> String {
-  let path = path.trim();
-  let components: Vec<&str> = path
-    .split('/')
-    .filter(|component| !component.is_empty())
-    .collect();
-
-  if components.len() >= 3 {
-    let tail = components[components.len() - 3..].join("/");
-    if tail.chars().count() <= max_chars {
-      return tail;
-    }
-  }
-
-  truncate_start(path, max_chars)
-}
-
-fn truncate_start(value: &str, max_chars: usize) -> String {
-  let len = value.chars().count();
-  if len <= max_chars {
-    return value.to_string();
-  }
-  if max_chars <= 3 {
-    return ".".repeat(max_chars);
-  }
-
-  let tail: String = value.chars().skip(len - (max_chars - 3)).collect();
-  format!("...{tail}")
 }
 
 fn secondary_style() -> Style {
