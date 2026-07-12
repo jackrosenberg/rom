@@ -247,18 +247,14 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
   hosts.sort();
   hosts.dedup();
 
-  let mut lines = vec![table_header(
-    "├",
-    &[columns.host_title, columns.pull_title, columns.push_title],
-    &columns.host_widths,
-    "┐",
-  )];
-  if hosts.is_empty() {
-    lines.push(table_row(
-      &["—".to_string(), "—".to_string(), "—".to_string()],
+  let mut lines = Vec::new();
+  if !hosts.is_empty() {
+    lines.push(table_header(
+      "├",
+      &[columns.host_title, columns.pull_title, columns.push_title],
       &columns.host_widths,
+      "┐",
     ));
-  } else {
     for host in hosts {
       let pull = pulls
         .get(&host)

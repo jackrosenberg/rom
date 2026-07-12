@@ -7,19 +7,20 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
     render_graph_screen(80, 8, &state.render_snapshot(), &tui_config());
 
   let first_activity = screen.row_text(0).unwrap();
-  let hosts_header = screen.row_text(1).unwrap();
-  let empty_host = screen.row_text(2).unwrap();
-  let builds_header = screen.row_text(3).unwrap();
-  let status = screen.row_text(4).unwrap();
-  let bottom_border = screen.row_text(5).unwrap();
+  let builds_header = screen.row_text(1).unwrap();
+  let status = screen.row_text(2).unwrap();
+  let bottom_border = screen.row_text(3).unwrap();
   assert!(
     first_activity.contains("hello-1.0"),
     "graph should begin without a redundant title: {first_activity:?}"
   );
   assert!(first_activity.starts_with("├─ "), "{first_activity:?}");
-  assert!(hosts_header.starts_with("├─ HOSTS "), "{hosts_header:?}");
-  assert!(empty_host.starts_with("│ —"), "{empty_host:?}");
   assert!(builds_header.starts_with("├─ BUILDS "), "{builds_header:?}");
+  assert!(
+    !screen.plain_text().contains("HOSTS"),
+    "{}",
+    screen.plain_text()
+  );
   assert!(status.contains("1 builds"), "unexpected status: {status:?}");
   assert!(status.contains("│ 1"), "running count missing: {status:?}");
   assert!(bottom_border.starts_with('└'), "{bottom_border:?}");
@@ -34,7 +35,7 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
       );
     }
   }
-  assert_eq!(screen.height(), 6);
+  assert_eq!(screen.height(), 4);
 }
 
 #[test]
@@ -43,7 +44,7 @@ fn narrow_footer_stays_a_connected_thin_table() {
   let screen =
     render_graph_screen(32, 8, &state.render_snapshot(), &tui_config());
   let rendered = screen.plain_text();
-  assert!(rendered.contains("├─ H "), "{rendered}");
+  assert!(!rendered.contains("├─ H "), "{rendered}");
   assert!(rendered.contains("├─ B "), "{rendered}");
   assert!(
     rendered.contains("┤ ") && rendered.contains(" ┘"),
@@ -64,8 +65,7 @@ fn final_and_live_renderers_share_the_connected_footer() {
   let snapshot = state.render_snapshot();
   let live = render_graph_screen(100, 12, &snapshot, &tui_config());
   let final_screen = render_final_graph_screen(100, &state, &tui_config());
-  for needle in ["├─ HOSTS ", "│ —", "├─ BUILDS ", "│ 1 builds", "┤"]
-  {
+  for needle in ["├─ BUILDS ", "│ 1 builds", "┤"] {
     assert!(live.plain_text().contains(needle), "{}", live.plain_text());
     assert!(
       final_screen.plain_text().contains(needle),
@@ -93,7 +93,7 @@ fn wide_graph_keeps_activity_metadata_inline() {
     row.contains("hello-1.0 · 4s"),
     "wide terminals should not push metadata to the right edge: {row:?}"
   );
-  let footer = screen.row_text(1).expect("host header");
+  let footer = screen.row_text(1).expect("build header");
   assert!(
     footer.trim_end().chars().count() <= 80,
     "table should keep a stable compact width: {footer:?}"
@@ -114,7 +114,7 @@ fn live_graph_footer_reports_multiple_roots() {
   let rendered = screen.plain_text();
   let rows = rendered.lines().collect::<Vec<_>>();
   assert!(rows[1].starts_with("├─ first-1.0"), "{rendered}");
-  assert!(rows[2].starts_with("├─ HOSTS "), "{rendered}");
+  assert!(rows[2].starts_with("├─ BUILDS "), "{rendered}");
   assert!(rendered.contains("│ 2 builds"), "{rendered}");
   let values = rows.iter().find(|row| row.contains("2 builds")).unwrap();
   assert!(values.split('│').any(|cell| cell.trim() == "2"), "{values}");
@@ -518,8 +518,8 @@ fn tui_keeps_root_visible_when_activity_graph_overflows() {
   let snapshot = state.render_snapshot();
   assert_eq!(
     rom_core::tui::minimum_required_graph_rows_at_width(100, &snapshot),
-    14,
-    "eight running dependencies, their unknown root, and connected table are \
+    12,
+    "eight running dependencies, their unknown root, and build table are \
      required"
   );
 

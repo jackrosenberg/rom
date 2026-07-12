@@ -341,7 +341,7 @@ fn tui_completed_builds_render_only_when_capacity_and_relevance_allow() {
     "completed activity should not use the old wind/leaf treatment: {rendered}"
   );
 
-  let backend = TestBackend::new(80, 9);
+  let backend = TestBackend::new(80, 10);
   let mut terminal = Terminal::new(backend).unwrap();
   let mut state = State::new();
   let drv_id = add_derivation(&mut state, "old-done-1.0");
@@ -374,7 +374,7 @@ fn tui_completed_builds_render_only_when_capacity_and_relevance_allow() {
   let rendered = format!("{}", terminal.backend());
   assert!(
     rendered.contains("old-done-1.0"),
-    "the one-row footer fallback should leave spare graph capacity: {rendered}"
+    "completed activity should render when graph capacity remains: {rendered}"
   );
 }
 
