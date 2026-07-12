@@ -5,7 +5,7 @@ use std::{
   ops::Index,
 };
 
-pub use crossterm::style::{Attribute, Attributes, Color, ContentStyle};
+pub use crossterm::style::{Attribute, Attributes, Color};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -26,52 +26,9 @@ impl Style {
   }
 
   #[must_use]
-  pub fn bg(mut self, color: Color) -> Self {
-    self.background = color_option(color);
-    self
-  }
-
-  #[must_use]
-  pub fn underline_color(mut self, color: Color) -> Self {
-    self.underline_color = color_option(color);
-    self
-  }
-
-  #[must_use]
   pub fn add_attribute(mut self, attribute: Attribute) -> Self {
     self.attributes.set(attribute);
     self
-  }
-
-  #[must_use]
-  pub fn remove_attribute(mut self, attribute: Attribute) -> Self {
-    self.attributes.unset(attribute);
-    self
-  }
-
-  #[must_use]
-  pub fn patch(mut self, other: Self) -> Self {
-    if other.foreground.is_some() {
-      self.foreground = other.foreground;
-    }
-    if other.background.is_some() {
-      self.background = other.background;
-    }
-    if other.underline_color.is_some() {
-      self.underline_color = other.underline_color;
-    }
-    self.attributes.extend(other.attributes);
-    self
-  }
-
-  #[must_use]
-  pub const fn content_style(self) -> ContentStyle {
-    ContentStyle {
-      foreground_color: self.foreground,
-      background_color: self.background,
-      underline_color:  self.underline_color,
-      attributes:       self.attributes,
-    }
   }
 }
 
@@ -143,11 +100,6 @@ impl Screen {
   }
 
   #[must_use]
-  pub const fn dimensions(&self) -> (u16, u16) {
-    (self.width, self.height)
-  }
-
-  #[must_use]
   pub fn cells(&self) -> &[ScreenCell] {
     &self.cells
   }
@@ -176,7 +128,7 @@ impl Screen {
   }
 
   #[must_use]
-  pub fn cell(&self, x: u16, y: u16) -> Option<&ScreenCell> {
+  fn cell(&self, x: u16, y: u16) -> Option<&ScreenCell> {
     self.index_of(x, y).map(|index| &self.cells[index])
   }
 
@@ -197,32 +149,6 @@ impl Screen {
       .filter_map(|y| self.row_text(y))
       .collect::<Vec<_>>()
       .join("\n")
-  }
-
-  /// Write one complete row with ANSI SGR styling and no trailing newline.
-  pub fn write_ansi_row<W: Write>(
-    &self,
-    y: u16,
-    writer: &mut W,
-  ) -> io::Result<()> {
-    let Some(row) = self.row(y) else {
-      return Ok(());
-    };
-    let mut active = Style::default();
-
-    for cell in row.iter().filter(|cell| !cell.is_continuation()) {
-      if cell.style != active {
-        writer.write_all(b"\x1b[0m")?;
-        write_style(writer, cell.style)?;
-        active = cell.style;
-      }
-      writer.write_all(cell.symbol.as_bytes())?;
-    }
-
-    if active != Style::default() {
-      writer.write_all(b"\x1b[0m")?;
-    }
-    Ok(())
   }
 
   /// Write a row without the framebuffer's trailing default cells.
@@ -252,17 +178,6 @@ impl Screen {
     }
     if active != Style::default() {
       writer.write_all(b"\x1b[0m")?;
-    }
-    Ok(())
-  }
-
-  /// Serialize the complete screen as ANSI-styled rows separated by CRLF.
-  pub fn write_ansi<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-    for y in 0..self.height {
-      if y > 0 {
-        writer.write_all(b"\r\n")?;
-      }
-      self.write_ansi_row(y, writer)?;
     }
     Ok(())
   }
@@ -753,12 +668,12 @@ mod tests {
       false,
     );
     let mut output = Vec::new();
-    screen.write_ansi_row(0, &mut output).unwrap();
+    screen.write_ansi_row_trimmed(0, &mut output).unwrap();
     let output = String::from_utf8(output).unwrap();
 
     assert!(output.contains("\x1b[1m"));
     assert!(output.contains("\x1b[31m"));
     assert!(output.contains('x'));
-    assert!(output.ends_with("\x1b[0m "));
+    assert!(output.ends_with("\x1b[0m"));
   }
 }

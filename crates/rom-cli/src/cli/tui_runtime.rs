@@ -387,13 +387,19 @@ pub(super) fn run_tui_render_loop(
 
     populate_pending_dependencies(shared);
 
-    let stdout_chunks = stdout_receiver.try_iter().collect::<Vec<_>>();
+    let mut stdout_chunks = stdout_receiver.try_iter().collect::<Vec<_>>();
+    let readers_done = shared.stderr_done.load(Ordering::Acquire)
+      && shared.stdout_done.load(Ordering::Acquire);
+    // The stdout reader publishes `stdout_done` only after its final send.
+    // Re-drain after observing that release so a chunk sent between the first
+    // drain and the acquire cannot be skipped by the completion break below.
+    if readers_done {
+      stdout_chunks.extend(stdout_receiver.try_iter());
+    }
     terminal
       .write_child_stdout(&stdout_chunks)
       .map_err(rom_core::error::RomError::Io)?;
 
-    let readers_done = shared.stderr_done.load(Ordering::Acquire)
-      && shared.stdout_done.load(Ordering::Acquire);
     runtime
       .draw(
         &mut terminal,

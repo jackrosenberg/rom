@@ -7,9 +7,27 @@ use rom_core::{
   create_monitor,
   monitor_stream,
   state::{BuildStatus, FailType},
+  types::{DisplayFormat, LegendStyle, LogPrefixStyle, SummaryStyle},
 };
 
 const DRV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0.drv";
+
+#[test]
+fn historical_config_struct_literals_remain_source_compatible() {
+  let config = Config {
+    piping:           true,
+    silent:           false,
+    input_mode:       InputMode::Human,
+    show_timers:      true,
+    width:            Some(80),
+    format:           DisplayFormat::Tree,
+    legend_style:     LegendStyle::Table,
+    summary_style:    SummaryStyle::Concise,
+    log_prefix_style: LogPrefixStyle::Short,
+    log_line_limit:   None,
+  };
+  create_monitor(config, Vec::new()).unwrap();
+}
 
 #[test]
 fn prefixed_json_is_auto_detected_and_logs_once() {

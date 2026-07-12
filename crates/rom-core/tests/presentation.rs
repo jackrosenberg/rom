@@ -543,6 +543,9 @@ fn full_summary_writer_supports_color_and_plain_generic_writers() {
       "Downloaded",
       "Uploaded",
       "Nix errors",
+      "HOST",
+      "builder.example",
+      "cache.example",
       "Outcome",
       "Time",
     ] {

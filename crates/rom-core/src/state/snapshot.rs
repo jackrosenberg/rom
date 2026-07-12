@@ -52,18 +52,23 @@ pub(crate) struct RenderTransferHostSummary {
 /// using [`State`].
 #[derive(Debug, Clone)]
 pub struct RenderSnapshot {
-  pub derivation_infos: IndexMap<DerivationId, RenderDerivationInfo>,
-  pub store_path_infos: IndexMap<StorePathId, StorePathInfo>,
-  pub full_summary:     DependencySummary,
-  pub forest_roots:     Vec<DerivationId>,
-  pub total_root_count: usize,
-  pub start_time:       f64,
-  pub activities:       HashMap<ActivityId, ActivityStatus>,
-  pub evaluation_state: EvalInfo,
+  pub derivation_infos:      IndexMap<DerivationId, RenderDerivationInfo>,
+  pub store_path_infos:      IndexMap<StorePathId, StorePathInfo>,
+  pub full_summary:          DependencySummary,
+  pub planned_build_count:   usize,
+  pub running_build_count:   usize,
+  pub completed_build_count: usize,
+  pub failed_build_count:    usize,
+  pub forest_roots:          Vec<DerivationId>,
+  pub total_root_count:      usize,
+  pub start_time:            f64,
+  pub activities:            HashMap<ActivityId, ActivityStatus>,
+  pub evaluation_state:      EvalInfo,
 
   derivation_name_index:               HashMap<String, HashSet<DerivationId>>,
   sort_keys: HashMap<DerivationId, crate::update::BuildSortKey>,
   dependency_owners:                   HashMap<DerivationId, DerivationId>,
+  remote_host_labels:                  HashMap<String, String>,
   pub(crate) completed_download_hosts: Vec<RenderTransferHostSummary>,
   pub(crate) completed_upload_hosts:   Vec<RenderTransferHostSummary>,
 }
@@ -82,17 +87,25 @@ impl State {
       .map(|id| (*id, crate::update::sort_key(self, *id)))
       .collect();
     let activities = self.render_activities(&derivation_infos);
+    let full_summary = self.render_dependency_summary(&derivation_infos);
+    let remote_host_labels =
+      render_remote_host_labels(&derivation_infos, &full_summary);
 
     RenderSnapshot {
       derivation_infos,
       store_path_infos: self.render_store_path_infos(),
-      full_summary: self.render_dependency_summary(),
+      full_summary,
+      planned_build_count: self.full_summary.planned_builds.len(),
+      running_build_count: self.full_summary.running_builds.len(),
+      completed_build_count: self.full_summary.completed_builds.len(),
+      failed_build_count: self.full_summary.failed_builds.len(),
       forest_roots,
       total_root_count: self.render_root_count(),
       start_time: self.start_time,
       derivation_name_index,
       sort_keys,
       dependency_owners,
+      remote_host_labels,
       activities,
       evaluation_state: self.evaluation_state.clone(),
       completed_download_hosts: render_completed_transfer_hosts(
@@ -115,12 +128,37 @@ impl State {
     roots.len()
   }
 
-  fn render_dependency_summary(&self) -> DependencySummary {
+  fn render_dependency_summary(
+    &self,
+    derivations: &IndexMap<DerivationId, RenderDerivationInfo>,
+  ) -> DependencySummary {
+    // Historical records are unbounded in `State`; a live frame only needs
+    // records represented by its bounded derivation projection plus aggregate
+    // counts stored separately on `RenderSnapshot`.
+    let included = |id: &DerivationId| derivations.contains_key(id);
     DependencySummary {
-      planned_builds:      self.full_summary.planned_builds.clone(),
-      running_builds:      self.full_summary.running_builds.clone(),
-      completed_builds:    self.full_summary.completed_builds.clone(),
-      failed_builds:       self.full_summary.failed_builds.clone(),
+      planned_builds:      self
+        .full_summary
+        .planned_builds
+        .iter()
+        .copied()
+        .filter(included)
+        .collect(),
+      running_builds:      self
+        .full_summary
+        .running_builds
+        .iter()
+        .filter(|(id, _)| included(id))
+        .map(|(id, build)| (*id, build.clone()))
+        .collect(),
+      completed_builds:    HashMap::new(),
+      failed_builds:       self
+        .full_summary
+        .failed_builds
+        .iter()
+        .filter(|(id, _)| included(id))
+        .map(|(id, build)| (*id, build.clone()))
+        .collect(),
       planned_downloads:   self.full_summary.planned_downloads.clone(),
       completed_downloads: HashMap::new(),
       completed_uploads:   HashMap::new(),
@@ -371,6 +409,10 @@ impl RenderSnapshot {
     self.dependency_owners.get(&id).copied()
   }
 
+  pub(crate) fn remote_host_label(&self, raw: &str) -> Option<&str> {
+    self.remote_host_labels.get(raw).map(String::as_str)
+  }
+
   pub fn derivation_ids_with_name(&self, name: &str) -> Vec<DerivationId> {
     self
       .derivation_name_index
@@ -379,6 +421,77 @@ impl RenderSnapshot {
       .flat_map(|ids| ids.iter().copied())
       .collect()
   }
+}
+
+fn render_remote_host_labels(
+  derivations: &IndexMap<DerivationId, RenderDerivationInfo>,
+  summary: &DependencySummary,
+) -> HashMap<String, String> {
+  let hosts = derivations
+    .values()
+    .filter_map(|info| {
+      match &info.build_status {
+        BuildStatus::Building(build)
+        | BuildStatus::Built { info: build, .. }
+        | BuildStatus::Failed { info: build, .. } => Some(&build.host),
+        BuildStatus::Unknown | BuildStatus::Planned => None,
+      }
+    })
+    .chain(
+      summary
+        .running_downloads
+        .values()
+        .map(|transfer| &transfer.host),
+    )
+    .chain(
+      summary
+        .running_uploads
+        .values()
+        .map(|transfer| &transfer.host),
+    )
+    .filter_map(|host| {
+      match host {
+        Host::Remote(raw) => Some(raw.as_str()),
+        Host::Localhost => None,
+      }
+    })
+    .collect::<HashSet<_>>();
+  let mut short_counts = HashMap::<&str, usize>::new();
+  for host in &hosts {
+    let count = short_counts.entry(short_host_name(host)).or_default();
+    *count = count.saturating_add(1);
+  }
+  hosts
+    .into_iter()
+    .map(|host| {
+      let short = short_host_name(host);
+      let label = if short_counts.get(short).copied().unwrap_or_default() > 1 {
+        host
+      } else {
+        short
+      };
+      (host.to_string(), label.to_string())
+    })
+    .collect()
+}
+
+fn short_host_name(host: &str) -> &str {
+  let without_scheme = host.split_once("://").map_or(host, |(_, rest)| rest);
+  let authority = without_scheme
+    .rsplit_once('@')
+    .map_or(without_scheme, |(_, rest)| rest);
+  let without_port = if let Some(bracketed) = authority.strip_prefix('[') {
+    bracketed
+      .split_once(']')
+      .map_or(authority, |(host, _)| host)
+  } else if authority.matches(':').count() == 1 {
+    authority
+      .split_once(':')
+      .map_or(authority, |(host, _)| host)
+  } else {
+    authority
+  };
+  without_port.split('.').next().unwrap_or(without_port)
 }
 
 fn render_completed_transfer_hosts<'a>(
@@ -489,6 +602,16 @@ mod tests {
   }
 
   #[test]
+  fn host_shortening_handles_ipv6_and_ports() {
+    assert_eq!(
+      short_host_name("ssh://user@[2001:db8::1]:22"),
+      "2001:db8::1"
+    );
+    assert_eq!(short_host_name("2001:db8::2"), "2001:db8::2");
+    assert_eq!(short_host_name("builder.example.org:22"), "builder");
+  }
+
+  #[test]
   fn snapshot_ranks_more_than_cap_candidates_before_truncating() {
     let mut state = State::new();
     let root = state.get_or_create_derivation_id(derivation("root"));
@@ -534,5 +657,26 @@ mod tests {
         .derivation_infos
         .contains_key(&children[MAX_RENDER_SNAPSHOT_DERIVATIONS - 1])
     );
+  }
+
+  #[test]
+  fn snapshot_counts_completed_builds_without_cloning_history() {
+    let mut state = State::new();
+    for index in 0..32 {
+      let id =
+        state.get_or_create_derivation_id(derivation(&format!("done-{index}")));
+      state.update_build_status(id, BuildStatus::Built {
+        info: BuildInfo {
+          start:       1.0,
+          host:        Host::Localhost,
+          activity_id: None,
+        },
+        end:  2.0,
+      });
+    }
+
+    let snapshot = state.render_snapshot();
+    assert_eq!(snapshot.completed_build_count, 32);
+    assert!(snapshot.full_summary.completed_builds.is_empty());
   }
 }

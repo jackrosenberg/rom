@@ -99,14 +99,16 @@ nix build nixpkgs#hello --log-format internal-json 2>&1 | rom --json --style ful
 
 The top-level `rom` crate re-exports the stream API from `rom-core`:
 `Config`, `InputMode`, `Monitor<W>`, `create_monitor`, and `monitor_stream`.
-Generic writers do not take terminal ownership; color and output width are
-selected through `Config`.
+Generic writers do not take terminal ownership; output width is selected with
+`Config::width`, and the historical `Config::piping = true` setting disables
+ANSI color for redirected output.
 
-Presentation selection is available through additive, non-breaking APIs:
+Presentation selection is available through additive APIs:
 `PresentationStyle`, `RenderOptions`, `MonitorOptions`,
 `create_monitor_with_options`, and `monitor_stream_with_options`. Existing
-callers can keep using `create_monitor` and `monitor_stream`; they use
-`PresentationStyle::Connected` by default. New callers can opt into any preset:
+`Config` struct literals and callers of `create_monitor` and `monitor_stream`
+remain source-compatible; they use `PresentationStyle::Connected` by default.
+New callers can opt into any preset:
 
 ```rust
 use rom::{Config, MonitorOptions, PresentationStyle, monitor_stream_with_options};
@@ -128,6 +130,23 @@ accepts legacy or arbitrary `.drv` path forms: embedding callers must provide
 canonical `/nix/store/<32-character-nix-base32-hash>-<name>.drv` paths. Public
 `Monitor::process_action` now emits message and build-log actions through the
 same exact-once writer path as JSON input.
+
+The old `--format`, `--legend`, `--summary`, and `--log-lines` flags were
+removed. Use the preset mapping `tree` → `connected`, `plain` → `plain`,
+`dashboard` → `dashboard`, compact/table/verbose legends → the matching
+`compact`/`connected`/`verbose` presets, and table/full summaries →
+`table-summary`/`full-summary`. Logs now stream above the bounded graph, so
+there is no retained log-line cap.
+
+The former `cache`, `display`, and `icons` modules and their renderer APIs were
+removed. The legacy `DisplayFormat`, `LegendStyle`, and `SummaryStyle` names
+remain as `Config` field types so old struct literals compile, but new rendering
+code should use `PresentationStyle`/`RenderOptions`. New presentation choices
+belong in `MonitorOptions`.
+The old parsing helpers `Monitor::extract_path_from_message` and
+`Monitor::extract_byte_size` were implementation details exposed accidentally;
+embedding code should parse its own unstructured messages or submit decoded
+Cognos actions through `Monitor::process_action`.
 
 ### Argument Passthrough
 

@@ -1,11 +1,6 @@
 //! Presentation presets and the internal rendering boundary.
 use std::{fmt, str::FromStr};
 
-use crate::{
-  state::{RenderSnapshot, State},
-  tui::{Screen, TuiConfig},
-};
-
 /// A named presentation preset accepted by the CLI `--style` flag and the
 /// library option types.
 ///
@@ -136,13 +131,6 @@ impl From<PresentationStyle> for MonitorOptions {
   }
 }
 
-/// Semantic input to a presentation renderer. Keeping this boundary separate
-/// from terminal control prevents renderers from acquiring terminal ownership.
-pub(crate) enum SemanticRenderModel<'a> {
-  Live(&'a RenderSnapshot),
-  Final(&'a State),
-}
-
 /// Colors used by the connected renderer.
 pub(crate) struct Palette;
 
@@ -207,34 +195,4 @@ impl Glyphs {
   pub(crate) const SUCCESS: &'static str = "✔";
   pub(crate) const SPINNER_FRAMES: &'static [&'static str] =
     &["⢄", "⢂", "⢁", "⡁", "⡈", "⡐", "⡠"];
-}
-
-/// Internal presentation dispatch. Presets share the connected activity graph
-/// and vary only the semantic footer rendered beneath it.
-pub(crate) fn render(
-  model: SemanticRenderModel<'_>,
-  width: u16,
-  soft_height: u16,
-  config: &TuiConfig,
-  options: RenderOptions,
-) -> Screen {
-  match model {
-    SemanticRenderModel::Live(state) => {
-      crate::tui::render_preset_graph_screen(
-        width,
-        soft_height,
-        state,
-        config,
-        options.style,
-      )
-    },
-    SemanticRenderModel::Final(state) => {
-      crate::tui::render_preset_final_graph_screen(
-        width,
-        state,
-        config,
-        options.style,
-      )
-    },
-  }
 }

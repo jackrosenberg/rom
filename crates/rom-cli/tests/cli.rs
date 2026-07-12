@@ -20,6 +20,11 @@ fn style_defaults_to_connected() {
 }
 
 #[test]
+fn log_prefix_rejects_unknown_values() {
+  assert!(Cli::try_parse_from(["rom", "--log-prefix", "shrot"]).is_err());
+}
+
+#[test]
 fn test_replace_command_with_exit() {
   let args = vec![
     "nixpkgs#hello".to_string(),

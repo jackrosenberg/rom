@@ -9,7 +9,6 @@ license.workspace = true
 [dependencies]
 cognos.workspace = true
 
-serde.workspace = true
 serde_json.workspace = true
 crossterm.workspace = true
 unicode-segmentation.workspace = true
@@ -18,7 +17,6 @@ indexmap.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-eyre.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

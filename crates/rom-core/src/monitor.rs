@@ -66,7 +66,7 @@ impl<W: Write> Monitor<W> {
     options: MonitorOptions,
     writer: W,
   ) -> Result<Self> {
-    if config.width == 0 {
+    if config.width == Some(0) {
       return Err(RomError::config("output width must be greater than zero"));
     }
     Ok(Self {
@@ -135,8 +135,12 @@ impl<W: Write> Monitor<W> {
         &mut self.writer,
         &self.state,
         ConsoleConfig {
-          use_color: self.config.use_color,
-          width: self.config.width,
+          use_color: !self.config.piping,
+          width: self
+            .config
+            .width
+            .unwrap_or(100)
+            .clamp(1, usize::from(u16::MAX)) as u16,
           ..ConsoleConfig::default()
         },
         self.options.render,
@@ -194,7 +198,7 @@ impl<W: Write> Monitor<W> {
   fn emit_action_log(&mut self, action: &Actions) -> Result<()> {
     match action {
       Actions::Message { msg, raw_msg, .. } => {
-        let line = if self.config.use_color {
+        let line = if !self.config.piping {
           msg.as_str()
         } else {
           raw_msg.as_deref().unwrap_or(msg.as_str())

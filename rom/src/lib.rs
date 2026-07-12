@@ -14,6 +14,7 @@ pub use rom_core::{
   create_monitor_with_options,
   error,
   graph,
+  monitor,
   monitor_stream,
   monitor_stream_with_options,
   presentation,

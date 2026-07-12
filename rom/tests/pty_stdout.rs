@@ -36,6 +36,7 @@ fn tty_child_stdout_is_streamed_once_while_graph_is_live() {
   let output = Command::new("script")
     .args(["-qfec", &command, "/dev/null"])
     .env("PATH", path)
+    .env("SHELL", "/bin/sh")
     .output()
     .unwrap();
 
@@ -100,6 +101,7 @@ fn resize_preserves_unretained_child_stdout_and_avoids_full_clear() {
   let output = Command::new("script")
     .args(["-qfec", &command, "/dev/null"])
     .env("PATH", path)
+    .env("SHELL", "/bin/sh")
     .output()
     .unwrap();
   let transcript = String::from_utf8_lossy(&output.stdout);

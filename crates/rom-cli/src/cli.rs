@@ -19,7 +19,7 @@ use std::{
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::log_store::{LogStore, post_tui_failure_error_lines};
+use crate::log_store::LogStore;
 
 pub(super) const DEPENDENCY_POPULATE_BUDGET_PER_FRAME: usize = 1;
 
@@ -67,7 +67,12 @@ pub struct Cli {
   pub style: rom_core::PresentationStyle,
 
   /// Log prefix style: short, full, none
-  #[arg(long, global = true, default_value = "short")]
+  #[arg(
+    long,
+    global = true,
+    default_value = "short",
+    value_parser = ["short", "full", "none"]
+  )]
   pub log_prefix: String,
 
   /// Nix-family evaluator to use. Auto-detected by default
@@ -259,9 +264,11 @@ pub fn run() -> eyre::Result<()> {
         } else {
           rom_core::InputMode::Human
         },
-        use_color,
-        width,
+        piping: !use_color,
+        width: Some(usize::from(width)),
         silent,
+        log_prefix_style,
+        ..rom_core::Config::default()
       };
       rom_core::monitor_stream_with_options(
         config,
@@ -513,7 +520,7 @@ fn run_monitored_command(
   stdout_result?.map_err(rom_core::error::RomError::Io)?;
   // Live TUI logs now remain in normal scrollback, so replaying selected
   // failure lines after teardown would print parsed stderr records twice.
-  finish_monitored_command(&shared, cfg, outcome, false)?;
+  finish_monitored_command(&shared, cfg, outcome)?;
 
   Ok(outcome.exit_code())
 }
@@ -772,8 +779,28 @@ fn build_log_prefix(
     })
     .map(|drv| drv.name)
     .unwrap_or_default();
+  let display_name = if matches!(style, rom_core::types::LogPrefixStyle::Short)
+  {
+    short_derivation_name(&name)
+  } else {
+    name.as_str()
+  };
 
-  Some((*id, format_log_prefix(&name, style, use_color)))
+  Some((*id, format_log_prefix(display_name, style, use_color)))
+}
+
+fn short_derivation_name(name: &str) -> &str {
+  name
+    .match_indices('-')
+    .find_map(|(index, _)| {
+      name[index + 1..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+        .then_some(&name[..index])
+    })
+    .filter(|name| !name.is_empty())
+    .unwrap_or(name)
 }
 
 fn format_log_prefix(
@@ -880,7 +907,6 @@ fn finish_monitored_command(
   shared: &MonitorShared,
   cfg: &WrapperConfig,
   outcome: MonitorOutcome,
-  show_failure_errors: bool,
 ) -> eyre::Result<()> {
   if outcome.is_cancelled() {
     let _ = writeln!(io::stderr(), "rom: build cancelled");
@@ -888,12 +914,7 @@ fn finish_monitored_command(
   }
 
   finish_monitor_state(shared);
-  render_final_after_monitor(
-    shared,
-    cfg,
-    outcome.exit_code(),
-    show_failure_errors,
-  )
+  render_final_after_monitor(shared, cfg, outcome.exit_code())
 }
 
 fn finish_monitor_state(shared: &MonitorShared) {
@@ -907,7 +928,6 @@ fn render_final_after_monitor(
   shared: &MonitorShared,
   cfg: &WrapperConfig,
   exit_code: i32,
-  show_failure_errors: bool,
 ) -> eyre::Result<()> {
   let state = shared.state.lock().unwrap();
   let mut console = console_config(io::stderr().is_terminal());
@@ -919,30 +939,7 @@ fn render_final_after_monitor(
     rom_core::RenderOptions { style: cfg.style },
   )
   .map_err(rom_core::error::RomError::Io)?;
-  if show_failure_errors && exit_code != 0 {
-    let logs = shared.log_store.snapshot();
-    write_post_tui_failure_errors(io::stderr(), &state, &logs)
-      .map_err(rom_core::error::RomError::Io)?;
-  }
   Ok(())
-}
-
-fn write_post_tui_failure_errors<W: Write>(
-  mut writer: W,
-  state: &rom_core::state::State,
-  logs: &[String],
-) -> io::Result<()> {
-  let lines = post_tui_failure_error_lines(state, logs);
-  if lines.is_empty() {
-    return Ok(());
-  }
-
-  writeln!(writer, "Build errors:")?;
-  for line in lines {
-    writeln!(writer, "{line}")?;
-  }
-  writeln!(writer)?;
-  writer.flush()
 }
 
 /// Replace --command/-c arguments with "sh -c exit" for monitoring pass
@@ -972,4 +969,27 @@ pub fn replace_command_with_exit(args: &[String]) -> Vec<String> {
   result.push("exit".to_string());
 
   result
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn short_log_prefix_drops_version_but_full_keeps_it() {
+    assert_eq!(short_derivation_name("hello-2.12.2"), "hello");
+    assert_eq!(
+      short_derivation_name("python3.12-requests-2.32"),
+      "python3.12-requests"
+    );
+    assert_eq!(short_derivation_name("source"), "source");
+    assert_eq!(
+      format_log_prefix(
+        "hello-2.12.2",
+        rom_core::types::LogPrefixStyle::Full,
+        false,
+      ),
+      "hello-2.12.2> "
+    );
+  }
 }

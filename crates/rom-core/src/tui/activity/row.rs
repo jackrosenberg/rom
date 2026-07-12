@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -363,51 +361,7 @@ fn remote_host_label(
   let cognos::Host::Remote(raw) = host else {
     return None;
   };
-  let short = short_host(raw);
-  let collides = remote_hosts(state)
-    .into_iter()
-    .any(|other| other != *raw && short_host(&other) == short);
-  Some(if collides {
-    raw.clone()
-  } else {
-    short.to_string()
-  })
-}
-
-fn short_host(host: &str) -> &str {
-  let without_scheme = host.split_once("://").map_or(host, |(_, rest)| rest);
-  let without_user = without_scheme
-    .rsplit_once('@')
-    .map_or(without_scheme, |(_, rest)| rest);
-  let without_port = without_user.split(':').next().unwrap_or(without_user);
-  without_port.split('.').next().unwrap_or(without_port)
-}
-
-fn remote_hosts(state: &RenderSnapshot) -> HashSet<String> {
-  let mut hosts = HashSet::new();
-  let mut insert = |host: &cognos::Host| {
-    if let cognos::Host::Remote(host) = host {
-      hosts.insert(host.clone());
-    }
-  };
-  for build in state.full_summary.running_builds.values() {
-    insert(&build.host);
-  }
-  for build in state.full_summary.completed_builds.values() {
-    insert(&build.host);
-  }
-  for build in state.full_summary.failed_builds.values() {
-    insert(&build.host);
-  }
-  for transfer in state
-    .full_summary
-    .running_downloads
-    .values()
-    .chain(state.full_summary.running_uploads.values())
-  {
-    insert(&transfer.host);
-  }
-  hosts
+  Some(state.remote_host_label(raw).unwrap_or(raw).to_string())
 }
 
 fn disambiguated_name(

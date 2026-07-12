@@ -11,7 +11,6 @@ pub use self::screen::{
   Attribute,
   Attributes,
   Color,
-  ContentStyle,
   Screen,
   ScreenCell,
   Style,
@@ -26,13 +25,7 @@ use self::{
 };
 use crate::{
   console::{ConsoleConfig, format_duration},
-  presentation::{
-    Glyphs,
-    Palette,
-    PresentationStyle,
-    RenderOptions,
-    SemanticRenderModel,
-  },
+  presentation::{Glyphs, Palette, PresentationStyle, RenderOptions},
   state::{RenderSnapshot, State, current_time},
 };
 
@@ -116,16 +109,10 @@ pub fn render_graph_screen_with_options(
   config: &TuiConfig,
   options: RenderOptions,
 ) -> Screen {
-  crate::presentation::render(
-    SemanticRenderModel::Live(state),
-    width,
-    soft_height,
-    config,
-    options,
-  )
+  render_preset_graph_screen(width, soft_height, state, config, options.style)
 }
 
-pub(crate) fn render_preset_graph_screen(
+fn render_preset_graph_screen(
   width: u16,
   soft_height: u16,
   state: &RenderSnapshot,
@@ -223,16 +210,10 @@ pub fn render_final_graph_screen_with_options(
   config: &TuiConfig,
   options: RenderOptions,
 ) -> Screen {
-  crate::presentation::render(
-    SemanticRenderModel::Final(state),
-    width,
-    u16::MAX,
-    config,
-    options,
-  )
+  render_preset_final_graph_screen(width, state, config, options.style)
 }
 
-pub(crate) fn render_preset_final_graph_screen(
+fn render_preset_final_graph_screen(
   width: u16,
   state: &State,
   config: &TuiConfig,
@@ -468,7 +449,7 @@ fn final_full_summary_lines(
   config: &TuiConfig,
 ) -> Vec<Line> {
   let totals = final_totals(state);
-  vec![
+  let mut lines = vec![
     final_summary_heading(
       usize::from(width).clamp(1, CONNECTED_TABLE_MAX_WIDTH),
     ),
@@ -509,8 +490,11 @@ fn final_full_summary_lines(
         Style::default().fg(MUTED_RED)
       },
     ),
-    final_outcome_line(state, config),
-  ]
+  ];
+  // Full summary is deliberately a strict superset of table summary: retain
+  // the per-host diagnostics and append its single outcome line.
+  lines.extend(final_table_summary_lines(width, state, config));
+  lines
 }
 
 fn final_outcome_line(state: &State, config: &TuiConfig) -> Line {
@@ -629,16 +613,15 @@ fn has_presentable_work(state: &RenderSnapshot) -> bool {
 }
 
 fn plain_summary_line(state: &RenderSnapshot) -> Line {
-  let summary = &state.full_summary;
   Line::from(vec![
     Span::styled(
       format!(
         "{} builds · {} running · {} waiting · {} done · {} failed",
         build_total(state),
-        summary.running_builds.len(),
-        summary.planned_builds.len(),
-        summary.completed_builds.len(),
-        summary.failed_builds.len(),
+        state.running_build_count,
+        state.planned_build_count,
+        state.completed_build_count,
+        state.failed_build_count,
       ),
       Style::default().fg(MOSS_GREEN),
     ),
@@ -687,10 +670,10 @@ fn dashboard_lines(state: &RenderSnapshot) -> Vec<Line> {
       format!(
         "{} total · {} running · {} waiting · {} done · {} failed",
         build_total(state),
-        summary.running_builds.len(),
-        summary.planned_builds.len(),
-        summary.completed_builds.len(),
-        summary.failed_builds.len(),
+        state.running_build_count,
+        state.planned_build_count,
+        state.completed_build_count,
+        state.failed_build_count,
       ),
       Style::default().fg(MOSS_GREEN),
     ),
@@ -917,20 +900,14 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
     &columns.build_widths,
     "┤",
   ));
-  let summary = &state.full_summary;
-  let total = summary
-    .planned_builds
-    .len()
-    .saturating_add(summary.running_builds.len())
-    .saturating_add(summary.completed_builds.len())
-    .saturating_add(summary.failed_builds.len());
+  let total = build_total(state);
   lines.push(table_row(
     &[
       format!("{total} builds"),
-      summary.running_builds.len().to_string(),
-      summary.planned_builds.len().to_string(),
-      summary.completed_builds.len().to_string(),
-      summary.failed_builds.len().to_string(),
+      state.running_build_count.to_string(),
+      state.planned_build_count.to_string(),
+      state.completed_build_count.to_string(),
+      state.failed_build_count.to_string(),
     ],
     &columns.build_widths,
     &[
@@ -1048,24 +1025,23 @@ fn distribute_columns(
 
 fn compact_footer_line(state: &RenderSnapshot, width: usize) -> Line {
   let width = width.clamp(1, CONNECTED_TABLE_MAX_WIDTH);
-  let summary = &state.full_summary;
   let total = build_total(state);
   let elapsed = format_duration(current_time() - state.start_time);
   let status = if width >= 64 {
     format!(
       " {total} builds · {} running · {} waiting · {} done · {} failed ",
-      summary.running_builds.len(),
-      summary.planned_builds.len(),
-      summary.completed_builds.len(),
-      summary.failed_builds.len(),
+      state.running_build_count,
+      state.planned_build_count,
+      state.completed_build_count,
+      state.failed_build_count,
     )
   } else {
     format!(
       " {total} builds · {}/{}/{}/{} ",
-      summary.running_builds.len(),
-      summary.planned_builds.len(),
-      summary.completed_builds.len(),
-      summary.failed_builds.len(),
+      state.running_build_count,
+      state.planned_build_count,
+      state.completed_build_count,
+      state.failed_build_count,
     )
   };
   let notch = format!("┤ {elapsed} ┘");
@@ -1122,10 +1098,10 @@ fn verbose_footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
       &format!(
         "{} total · {} running · {} waiting · {} done · {} failed",
         build_total(state),
-        summary.running_builds.len(),
-        summary.planned_builds.len(),
-        summary.completed_builds.len(),
-        summary.failed_builds.len(),
+        state.running_build_count,
+        state.planned_build_count,
+        state.completed_build_count,
+        state.failed_build_count,
       ),
       Style::default().fg(MOSS_GREEN),
     ),
@@ -1197,13 +1173,11 @@ fn verbose_status_style(status: &str) -> Style {
 }
 
 fn build_total(state: &RenderSnapshot) -> usize {
-  let summary = &state.full_summary;
-  summary
-    .planned_builds
-    .len()
-    .saturating_add(summary.running_builds.len())
-    .saturating_add(summary.completed_builds.len())
-    .saturating_add(summary.failed_builds.len())
+  state
+    .planned_build_count
+    .saturating_add(state.running_build_count)
+    .saturating_add(state.completed_build_count)
+    .saturating_add(state.failed_build_count)
 }
 
 fn aggregate_cache_activity<'a>(
