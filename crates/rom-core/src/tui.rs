@@ -247,7 +247,6 @@ const CONNECTED_TABLE_MAX_WIDTH: usize = 80;
 
 fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
   let width = width.clamp(1, CONNECTED_TABLE_MAX_WIDTH);
-  let columns = FooterColumns::for_width(width);
   let (pulls, pushes) = cache_activity(state);
   let mut hosts = pulls
     .keys()
@@ -256,6 +255,12 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
     .collect::<Vec<_>>();
   hosts.sort();
   hosts.dedup();
+  let longest_host = hosts
+    .iter()
+    .map(|host| display_width(host))
+    .max()
+    .unwrap_or(0);
+  let columns = FooterColumns::for_width(width, longest_host);
 
   let mut lines = Vec::new();
   if !hosts.is_empty() {
@@ -340,7 +345,7 @@ struct FooterColumns {
 }
 
 impl FooterColumns {
-  fn for_width(width: usize) -> Self {
+  fn for_width(width: usize, longest_host: usize) -> Self {
     let (host_title, pull_title, push_title, build_titles, detail) =
       if width >= 72 {
         (
@@ -367,12 +372,32 @@ impl FooterColumns {
           false,
         )
       };
+    let host_available = width.saturating_sub(7);
+    let pull_min = display_width(&format!(" {pull_title} "));
+    let push_min = display_width(&format!(" {push_title} "));
+    let host_min = display_width(&format!(" {host_title} "));
+    let mut host_widths = if host_available
+      >= host_min.saturating_add(pull_min).saturating_add(push_min)
+    {
+      let host_width = longest_host
+        .max(host_min)
+        .min(host_available.saturating_sub(pull_min.saturating_add(push_min)));
+      vec![host_width, pull_min, push_min]
+    } else {
+      distribute_columns(host_available, 3, &[2, 1, 1])
+    };
+    let assigned = host_widths.iter().sum::<usize>();
+    let extra = host_available.saturating_sub(assigned);
+    for index in 0..extra {
+      host_widths[1 + index % 2] += 1;
+    }
+
     Self {
       host_title,
       pull_title,
       push_title,
       build_titles,
-      host_widths: distribute_columns(width.saturating_sub(7), 3, &[2, 1, 1]),
+      host_widths,
       build_widths: distribute_columns(width.saturating_sub(11), 5, &[
         2, 1, 1, 1, 1,
       ]),

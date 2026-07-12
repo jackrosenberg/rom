@@ -129,6 +129,28 @@ fn connected_footer_lists_distinct_remote_hosts_once_each() {
 }
 
 #[test]
+fn connected_footer_preserves_long_remote_hostnames() {
+  let mut state = running_state();
+  let path = add_store_path(&mut state, "long-host-output");
+  let host = "binary-cache-for-the-primary-build-cluster.example.org";
+  state
+    .full_summary
+    .running_downloads
+    .insert(path, TransferInfo {
+      start:             current_time(),
+      host:              cognos::Host::Remote(format!("https://{host}")),
+      activity_id:       1,
+      bytes_transferred: 0,
+      total_bytes:       None,
+    });
+
+  let rendered =
+    render_graph_screen(80, 12, &state.render_snapshot(), &tui_config())
+      .plain_text();
+  assert!(rendered.contains(host), "{rendered}");
+}
+
+#[test]
 fn cache_sidecar_retains_completed_cache_activity() {
   let backend = TestBackend::new(100, 12);
   let mut terminal = Terminal::new(backend).unwrap();
@@ -344,6 +366,12 @@ fn tui_renders_running_downloads_inline_in_dependency_graph() {
   assert!(
     download_row.contains("512 B / 1.0 KiB"),
     "running substitute should show transfer progress: {download_row:?}"
+  );
+  assert!(
+    !download_row.contains("cache.nixos.org")
+      && !download_row.contains("from cache"),
+    "download rows should leave remote hosts to the host table: \
+     {download_row:?}"
   );
   assert!(
     rendered.contains("0/1"),

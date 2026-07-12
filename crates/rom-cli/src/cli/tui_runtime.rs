@@ -17,6 +17,8 @@ use crossterm::{
     BeginSynchronizedUpdate,
     Clear,
     ClearType,
+    DisableLineWrap,
+    EnableLineWrap,
     EndSynchronizedUpdate,
   },
 };
@@ -168,7 +170,7 @@ impl TerminalSession {
         .as_ref()
         .is_some_and(|screen| screen.height() != height);
 
-    execute!(self.stderr, BeginSynchronizedUpdate)?;
+    execute!(self.stderr, BeginSynchronizedUpdate, DisableLineWrap)?;
     let update_result: io::Result<()> = (|| {
       if terminal_resized {
         // Never clear the normal screen: it contains child stdout that is not
@@ -221,7 +223,7 @@ impl TerminalSession {
             cursor::MoveTo(0, scroll_bottom.saturating_sub(1)),
             Clear(ClearType::CurrentLine)
           )?;
-          rendered.write_ansi_row(y, &mut self.stderr)?;
+          rendered.write_ansi_row_trimmed(y, &mut self.stderr)?;
           // A newline at the physical bottom scrolls this row into normal
           // terminal history, leaving the transient region anchored in place.
           queue!(
@@ -239,15 +241,20 @@ impl TerminalSession {
         if unchanged {
           continue;
         }
-        queue!(self.stderr, cursor::MoveTo(0, self.origin_y + y))?;
-        screen.write_ansi_row(y, &mut self.stderr)?;
+        queue!(
+          self.stderr,
+          cursor::MoveTo(0, self.origin_y + y),
+          Clear(ClearType::CurrentLine)
+        )?;
+        screen.write_ansi_row_trimmed(y, &mut self.stderr)?;
       }
       queue!(self.stderr, cursor::RestorePosition)?;
       self.stderr.flush()?;
       self.previous = Some(screen);
       Ok(())
     })();
-    let end_result = execute!(self.stderr, EndSynchronizedUpdate);
+    let end_result =
+      execute!(self.stderr, EnableLineWrap, EndSynchronizedUpdate);
 
     update_result?;
     end_result
@@ -278,6 +285,7 @@ impl Drop for TerminalSession {
       Clear(ClearType::FromCursorDown),
       SetAttribute(Attribute::Reset),
       Print("\x1b[r"),
+      EnableLineWrap,
       cursor::Show,
       EndSynchronizedUpdate
     );

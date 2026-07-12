@@ -236,12 +236,10 @@ fn transfer_suffix(
           format_bytes(total)
         ));
       }
-      if let Some(host) = remote_host_label(state, &transfer.host) {
-        let direction = match kind {
-          TransferKind::Download => "from",
-          TransferKind::Upload => "to",
-        };
-        parts.push(format!("{direction} {host}"));
+      if matches!(kind, TransferKind::Upload)
+        && let Some(host) = remote_host_label(state, &transfer.host)
+      {
+        parts.push(format!("to {host}"));
       }
       (!parts.is_empty()).then(|| parts.join(" "))
     },
