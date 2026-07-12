@@ -1,4 +1,23 @@
-use rom_cli::{parse_args_with_separator, replace_command_with_exit};
+use clap::Parser;
+use rom_cli::{Cli, parse_args_with_separator, replace_command_with_exit};
+
+#[test]
+fn style_is_global_and_rejects_unknown_values() {
+  let cli =
+    Cli::try_parse_from(["rom", "--style", "table", "build", "pkg"]).unwrap();
+  assert_eq!(cli.style, rom_core::PresentationStyle::TableSummary);
+
+  let cli =
+    Cli::try_parse_from(["rom", "build", "pkg", "--style", "plain"]).unwrap();
+  assert_eq!(cli.style, rom_core::PresentationStyle::Plain);
+  assert!(Cli::try_parse_from(["rom", "--style", "mystery"]).is_err());
+}
+
+#[test]
+fn style_defaults_to_connected() {
+  let cli = Cli::try_parse_from(["rom"]).unwrap();
+  assert_eq!(cli.style, rom_core::PresentationStyle::Connected);
+}
 
 #[test]
 fn test_replace_command_with_exit() {

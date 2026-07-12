@@ -152,6 +152,20 @@ impl Screen {
     &self.cells
   }
 
+  pub(super) fn append_below(mut self, other: Self) -> Self {
+    debug_assert_eq!(self.width, other.width);
+    if self.width != other.width {
+      return self;
+    }
+    let appended_height = self.height.saturating_add(other.height);
+    let appended_cells =
+      usize::from(self.width).saturating_mul(usize::from(appended_height));
+    self.cells.extend(other.cells);
+    self.cells.truncate(appended_cells);
+    self.height = appended_height;
+    self
+  }
+
   #[must_use]
   pub fn row(&self, y: u16) -> Option<&[ScreenCell]> {
     if y >= self.height {

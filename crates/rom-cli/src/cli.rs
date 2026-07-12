@@ -61,6 +61,11 @@ pub struct Cli {
   #[arg(long, global = true)]
   pub silent: bool,
 
+  /// Presentation style: connected, compact, verbose, plain, dashboard,
+  /// table-summary, or full-summary
+  #[arg(long, global = true, default_value_t)]
+  pub style: rom_core::PresentationStyle,
+
   /// Log prefix style: short, full, none
   #[arg(long, global = true, default_value = "short")]
   pub log_prefix: String,
@@ -113,6 +118,7 @@ pub(super) struct WrapperConfig {
   silent:           bool,
   verbose:          u8,
   log_prefix_style: rom_core::types::LogPrefixStyle,
+  style:            rom_core::PresentationStyle,
 }
 
 /// Run the CLI application
@@ -161,6 +167,7 @@ pub fn run() -> eyre::Result<()> {
     silent,
     verbose,
     log_prefix_style,
+    style: cli.style,
   };
 
   match (&program_name[..], cli.command) {
@@ -256,7 +263,12 @@ pub fn run() -> eyre::Result<()> {
         width,
         silent,
       };
-      rom_core::monitor_stream(config, stdin.lock(), stdout.lock())?;
+      rom_core::monitor_stream_with_options(
+        config,
+        rom_core::MonitorOptions::from(cli.style),
+        stdin.lock(),
+        stdout.lock(),
+      )?;
       Ok(())
     },
   }
@@ -893,15 +905,20 @@ fn finish_monitor_state(shared: &MonitorShared) {
 
 fn render_final_after_monitor(
   shared: &MonitorShared,
-  _cfg: &WrapperConfig,
+  cfg: &WrapperConfig,
   exit_code: i32,
   show_failure_errors: bool,
 ) -> eyre::Result<()> {
   let state = shared.state.lock().unwrap();
   let mut console = console_config(io::stderr().is_terminal());
   console.process_exit_code = Some(exit_code);
-  rom_core::console::write_final_graph(io::stderr(), &state, console)
-    .map_err(rom_core::error::RomError::Io)?;
+  rom_core::console::write_final_graph_with_options(
+    io::stderr(),
+    &state,
+    console,
+    rom_core::RenderOptions { style: cfg.style },
+  )
+  .map_err(rom_core::error::RomError::Io)?;
   if show_failure_errors && exit_code != 0 {
     let logs = shared.log_store.snapshot();
     write_post_tui_failure_errors(io::stderr(), &state, &logs)

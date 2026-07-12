@@ -36,6 +36,7 @@ Commands:
 Options:
       --json                     Parse unprefixed Nix internal-json records from stdin
       --silent                   Minimal output
+      --style <STYLE>            Presentation style: connected, compact, verbose, plain, dashboard, table-summary, or full-summary [default: connected]
       --log-prefix <LOG_PREFIX>  Log prefix style: short, full, none [default: short]
       --platform <PLATFORM>      Nix-family evaluator to use. Auto-detected by default
   -v...                          Increase verbosity; controls nix log level and rom diagnostic output. Repeatable: -v (info), -vv (debug), -vvv (trace)
@@ -69,12 +70,55 @@ nix build nixpkgs#hello --log-format internal-json 2>&1 | rom --json
 also accepts unprefixed records. Stream output is append-only, making this mode
 safe for redirection and library writers.
 
+### Presentation styles
+
+Use `--style <STYLE>` with any ROM invocation, including stdin monitoring and
+Nix-wrapper subcommands. Seven presets are available:
+
+- `connected`: default connected activity tree with the standard build/cache
+  footer. The alias `tree` is also accepted.
+- `compact`: connected activity tree with a single-line summary footer for
+  narrow terminals or dense logs.
+- `verbose`: connected activity tree with expanded status, cache, and outcome
+  details.
+- `plain`: minimal flat text view without graph chrome.
+- `dashboard`: dashboard-oriented live status view.
+- `table-summary`: connected live/final graph plus a tabular final summary.
+  The alias `table` is also accepted.
+- `full-summary`: connected live/final graph plus the most complete final
+  summary. The alias `full` is also accepted.
+
+For example:
+
+```sh
+rom --style compact build nixpkgs#hello
+nix build nixpkgs#hello --log-format internal-json 2>&1 | rom --json --style full-summary
+```
+
 ### Library API
 
 The top-level `rom` crate re-exports the stream API from `rom-core`:
 `Config`, `InputMode`, `Monitor<W>`, `create_monitor`, and `monitor_stream`.
 Generic writers do not take terminal ownership; color and output width are
 selected through `Config`.
+
+Presentation selection is available through additive, non-breaking APIs:
+`PresentationStyle`, `RenderOptions`, `MonitorOptions`,
+`create_monitor_with_options`, and `monitor_stream_with_options`. Existing
+callers can keep using `create_monitor` and `monitor_stream`; they use
+`PresentationStyle::Connected` by default. New callers can opt into any preset:
+
+```rust
+use rom::{Config, MonitorOptions, PresentationStyle, monitor_stream_with_options};
+
+let config = Config::default();
+let options = MonitorOptions::from(PresentationStyle::Compact);
+let input = std::io::Cursor::new(Vec::<u8>::new());
+let mut output = Vec::new();
+
+monitor_stream_with_options(config, options, input, &mut output)?;
+# Ok::<(), rom::RomError>(())
+```
 
 ### Migrating to 0.3
 

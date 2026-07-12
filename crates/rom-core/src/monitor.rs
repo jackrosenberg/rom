@@ -7,9 +7,10 @@ use std::{
 use cognos::{Actions, Host, ResultType};
 
 use crate::{
-  console::{ConsoleConfig, write_final_graph},
+  console::ConsoleConfig,
   error::{Result, RomError},
   graph::GraphIndexer,
+  presentation::MonitorOptions,
   state::{
     BuildInfo,
     BuildStatus,
@@ -48,6 +49,7 @@ pub struct Monitor<W: Write> {
   graph:       GraphIndexer,
   writer:      W,
   config:      Config,
+  options:     MonitorOptions,
   human_state: HumanParserState,
   finished:    bool,
 }
@@ -55,6 +57,15 @@ pub struct Monitor<W: Write> {
 impl<W: Write> Monitor<W> {
   /// Create a monitor writing to `writer`.
   pub fn new(config: Config, writer: W) -> Result<Self> {
+    Self::new_with_options(config, MonitorOptions::default(), writer)
+  }
+
+  /// Create a monitor with explicit presentation options.
+  pub fn new_with_options(
+    config: Config,
+    options: MonitorOptions,
+    writer: W,
+  ) -> Result<Self> {
     if config.width == 0 {
       return Err(RomError::config("output width must be greater than zero"));
     }
@@ -63,6 +74,7 @@ impl<W: Write> Monitor<W> {
       graph: GraphIndexer::new(),
       writer,
       config,
+      options,
       human_state: HumanParserState::Idle,
       finished: false,
     })
@@ -119,11 +131,16 @@ impl<W: Write> Monitor<W> {
         .graph
         .drain_pending(&mut self.state, Duration::from_secs(2));
       update::finish_state(&mut self.state);
-      write_final_graph(&mut self.writer, &self.state, ConsoleConfig {
-        use_color: self.config.use_color,
-        width: self.config.width,
-        ..ConsoleConfig::default()
-      })
+      crate::console::write_final_graph_with_options(
+        &mut self.writer,
+        &self.state,
+        ConsoleConfig {
+          use_color: self.config.use_color,
+          width: self.config.width,
+          ..ConsoleConfig::default()
+        },
+        self.options.render,
+      )
       .map_err(RomError::Io)?;
     }
 

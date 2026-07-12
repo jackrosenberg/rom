@@ -84,10 +84,24 @@ impl RenderedActivityLine {
 }
 
 pub(super) fn activity_line(args: ActivityLine<'_>) -> RenderedActivityLine {
+  let row_activity = row_activity(args.transfer_lookup, args.drv_id, args.info);
+  activity_line_with_kind(args, row_activity)
+}
+
+pub(super) fn build_activity_line(
+  args: ActivityLine<'_>,
+) -> RenderedActivityLine {
+  activity_line_with_kind(args, RowActivity::Build)
+}
+
+fn activity_line_with_kind(
+  args: ActivityLine<'_>,
+  row_activity: RowActivity,
+) -> RenderedActivityLine {
   let ActivityLine {
     state,
-    transfer_lookup,
-    drv_id,
+    transfer_lookup: _,
+    drv_id: _,
     info,
     collapsed_deps,
     depth,
@@ -95,7 +109,6 @@ pub(super) fn activity_line(args: ActivityLine<'_>) -> RenderedActivityLine {
     width,
   } = args;
   let prefix_width = depth.saturating_mul(3);
-  let row_activity = row_activity(transfer_lookup, drv_id, info);
   let (status, status_style) =
     status_indicator(&row_activity, &info.build_status, now);
   let status_prefix_width = if status.is_empty() {

@@ -5,6 +5,7 @@ use row::{
   ActivityLine,
   RenderedActivityLine,
   activity_line,
+  build_activity_line,
   transfer_activity_line,
 };
 
@@ -178,6 +179,69 @@ fn transfer_activity_order_key(
     },
     TransferActivity::PlannedDownload { path_id } => (1, 0, 0, *path_id),
   }
+}
+
+pub(super) fn render_flat_active_lines(
+  state: &RenderSnapshot,
+  width: usize,
+) -> Vec<Line> {
+  let transfers = TransferLookup::from_state(state);
+  let now = current_time();
+  let mut lines = Vec::new();
+  let mut builds = state
+    .full_summary
+    .failed_builds
+    .keys()
+    .chain(state.full_summary.running_builds.keys())
+    .copied()
+    .collect::<Vec<_>>();
+  builds.sort_unstable();
+  builds.dedup();
+  for drv_id in builds {
+    let Some(info) = state.get_derivation_info(drv_id) else {
+      continue;
+    };
+    lines.push(
+      build_activity_line(ActivityLine {
+        state,
+        transfer_lookup: &transfers,
+        drv_id,
+        info,
+        collapsed_deps: CollapsedDependencies::default(),
+        depth: 0,
+        now,
+        width,
+      })
+      .to_line(),
+    );
+  }
+
+  let mut running = state
+    .full_summary
+    .running_downloads
+    .iter()
+    .map(|(path_id, transfer)| {
+      TransferActivity::Running {
+        kind:     TransferKind::Download,
+        path_id:  *path_id,
+        transfer: transfer.clone(),
+      }
+    })
+    .chain(state.full_summary.running_uploads.iter().map(
+      |(path_id, transfer)| {
+        TransferActivity::Running {
+          kind:     TransferKind::Upload,
+          path_id:  *path_id,
+          transfer: transfer.clone(),
+        }
+      },
+    ))
+    .collect::<Vec<_>>();
+  running.sort_by_key(transfer_activity_order_key);
+  lines.extend(running.iter().filter_map(|transfer| {
+    transfer_activity_line(state, transfer, now, width)
+  }));
+  lines
 }
 
 pub(super) fn minimum_required_activity_rows(state: &RenderSnapshot) -> usize {

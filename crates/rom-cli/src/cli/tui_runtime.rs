@@ -144,17 +144,25 @@ impl TerminalSession {
     state: &rom_core::state::RenderSnapshot,
     new_logs: &[String],
     config: &rom_core::tui::TuiConfig,
+    options: rom_core::RenderOptions,
   ) -> io::Result<()> {
     let (width, terminal_height) = terminal::size()?;
     let minimum_height = u16::try_from(
-      rom_core::tui::minimum_required_graph_rows_at_width(width, state),
+      rom_core::tui::minimum_required_graph_rows_at_width_with_options(
+        width, state, options,
+      ),
     )
     .unwrap_or(u16::MAX);
     // Keep at least one physical row outside the graph. Mandatory graph rows
     // are clipped to this budget rather than taking away the streaming region.
     let soft_height = graph_height_budget(terminal_height, minimum_height);
-    let screen =
-      rom_core::tui::render_graph_screen(width, soft_height, state, config);
+    let screen = rom_core::tui::render_graph_screen_with_options(
+      width,
+      soft_height,
+      state,
+      config,
+      options,
+    );
     let height = screen.height();
     let origin_y = terminal_height.saturating_sub(height);
     let previous_height = self.previous.as_ref().map_or(
@@ -306,6 +314,7 @@ impl TuiRuntime {
     silent: bool,
     flush_all_logs: bool,
     config: &rom_core::tui::TuiConfig,
+    options: rom_core::RenderOptions,
   ) -> io::Result<()> {
     if shared.screen_dirty.swap(false, Ordering::AcqRel) {
       terminal.invalidate();
@@ -323,7 +332,7 @@ impl TuiRuntime {
       }
     };
     let state = shared.state.lock().unwrap().render_snapshot();
-    terminal.draw(&state, &new_logs, config)
+    terminal.draw(&state, &new_logs, config, options)
   }
 }
 
@@ -392,6 +401,7 @@ pub(super) fn run_tui_render_loop(
         cfg.silent,
         status.is_some(),
         &tui_config,
+        rom_core::RenderOptions { style: cfg.style },
       )
       .map_err(rom_core::error::RomError::Io)?;
 

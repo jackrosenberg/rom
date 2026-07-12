@@ -1,7 +1,10 @@
 //! Shared rendering seam for the live operations console and its final graph.
 use std::io::{self, Write};
 
-use crate::state::{State, current_time};
+use crate::{
+  presentation::{Glyphs, RenderOptions},
+  state::{State, current_time},
+};
 
 /// Rendering options used by the operations console.
 #[derive(Clone, Copy)]
@@ -55,13 +58,32 @@ pub fn format_duration(secs: f64) -> String {
 
 /// Write the stable post-build graph using the live console renderer.
 pub fn write_final_graph<W: Write>(
-  mut writer: W,
+  writer: W,
   state: &State,
   config: ConsoleConfig,
 ) -> io::Result<()> {
+  write_final_graph_with_options(
+    writer,
+    state,
+    config,
+    RenderOptions::default(),
+  )
+}
+
+/// Write the stable post-build graph using an explicit presentation preset.
+pub fn write_final_graph_with_options<W: Write>(
+  mut writer: W,
+  state: &State,
+  config: ConsoleConfig,
+  options: RenderOptions,
+) -> io::Result<()> {
   let tui_config = crate::tui::TuiConfig { console: config };
-  let screen =
-    crate::tui::render_final_graph_screen(config.width, state, &tui_config);
+  let screen = crate::tui::render_final_graph_screen_with_options(
+    config.width,
+    state,
+    &tui_config,
+    options,
+  );
   for y in 0..screen.height() {
     if config.use_color {
       screen.write_ansi_row_trimmed(y, &mut writer)?;
@@ -71,13 +93,21 @@ pub fn write_final_graph<W: Write>(
     writeln!(writer)?;
   }
 
-  write_finished_line(
-    &mut writer,
-    state,
-    config.use_color,
-    config.process_exit_code,
-  )?;
-  writeln!(writer)?;
+  if matches!(
+    options.style,
+    crate::PresentationStyle::TableSummary
+      | crate::PresentationStyle::FullSummary
+  ) {
+    writeln!(writer)?;
+  } else {
+    write_finished_line(
+      &mut writer,
+      state,
+      config.use_color,
+      config.process_exit_code,
+    )?;
+    writeln!(writer)?;
+  }
   writer.flush()
 }
 
@@ -97,7 +127,7 @@ fn write_finished_line<W: Write>(
     let noun = if failed == 1 { "failure" } else { "failures" };
     format!(
       "{} {} at {} after {}",
-      colored("✗", "1", use_color),
+      colored(Glyphs::FAILURE, "1", use_color),
       colored(
         &format!("Exited after {failed} build {noun}"),
         "1",
@@ -110,7 +140,7 @@ fn write_finished_line<W: Write>(
     let noun = if nix_errors == 1 { "error" } else { "errors" };
     format!(
       "{} {} at {} after {}",
-      colored("✗", "1", use_color),
+      colored(Glyphs::FAILURE, "1", use_color),
       colored(
         &format!("Exited with {nix_errors} nix {noun}"),
         "1",
@@ -122,7 +152,7 @@ fn write_finished_line<W: Write>(
   } else if let Some(code) = process_exit_code.filter(|code| *code != 0) {
     format!(
       "{} {} at {} after {}",
-      colored("✗", "1", use_color),
+      colored(Glyphs::FAILURE, "1", use_color),
       colored(
         &format!("Evaluator exited with status {code}"),
         "1",
@@ -138,7 +168,10 @@ fn write_finished_line<W: Write>(
       colored(&duration, "2", use_color),
     );
     if completed > 0 {
-      line.push_str(&format!("  {} {completed}", colored("✔", "2", use_color)));
+      line.push_str(&format!(
+        "  {} {completed}",
+        colored(Glyphs::SUCCESS, "2", use_color)
+      ));
     }
     line
   };
