@@ -1,6 +1,8 @@
 //! Full-screen styled framebuffer renderer for ROM.
 use std::collections::BTreeMap;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 mod activity;
 mod logs;
 mod screen;
@@ -193,16 +195,6 @@ pub(super) fn hierarchy_style() -> Style {
   Style::default().fg(GRAPH_LINE_COLOR)
 }
 
-const BUILD_PANEL_WIDTH: usize = 28;
-const BUILD_PANEL_HEIGHT: usize = 8;
-const PANEL_GAP: usize = 2;
-const WIDE_PANEL_MIN_WIDTH: usize = 94;
-const PROGRESS_START: Color = Color::Rgb {
-  r: 73,
-  g: 115,
-  b: 255,
-};
-
 #[derive(Clone, Debug, Default)]
 struct CacheActivity {
   active:           usize,
@@ -239,7 +231,7 @@ fn draw_console_footer(
     return;
   }
   let lines = if height == 1 {
-    vec![compact_build_status(state)]
+    vec![compact_footer_line(state, usize::from(screen.width()))]
   } else {
     footer_lines(state, usize::from(screen.width()))
   };
@@ -247,341 +239,299 @@ fn draw_console_footer(
 }
 
 fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
-  let cache = cache_panel_lines(
-    state,
-    width.saturating_sub(BUILD_PANEL_WIDTH + PANEL_GAP),
-  );
-  if width >= WIDE_PANEL_MIN_WIDTH && !cache.is_empty() {
-    return join_panels(build_panel_lines(state, BUILD_PANEL_WIDTH), cache);
+  let width = width.max(1);
+  let columns = FooterColumns::for_width(width);
+  let (pulls, pushes) = cache_activity(state);
+  let mut hosts = pulls
+    .keys()
+    .chain(pushes.keys())
+    .cloned()
+    .collect::<Vec<_>>();
+  hosts.sort();
+  hosts.dedup();
+
+  let mut lines = vec![table_header(
+    "├",
+    &[columns.host_title, columns.pull_title, columns.push_title],
+    &columns.host_widths,
+    "┐",
+  )];
+  if hosts.is_empty() {
+    lines.push(table_row(
+      &["—".to_string(), "—".to_string(), "—".to_string()],
+      &columns.host_widths,
+      &[TEXT_MUTED; 3],
+    ));
+  } else {
+    for host in hosts {
+      let pull = pulls
+        .get(&host)
+        .map(|activity| transfer_cell(activity, columns.detail))
+        .unwrap_or_else(|| "—".to_string());
+      let push = pushes
+        .get(&host)
+        .map(|activity| transfer_cell(activity, columns.detail))
+        .unwrap_or_else(|| "—".to_string());
+      lines.push(table_row(
+        &[host, pull, push],
+        &columns.host_widths,
+        [TEXT_PRIMARY, DOWNLOAD_BLUE, UPLOAD_PURPLE].as_ref(),
+      ));
+    }
   }
 
-  let panel_width = width.max(BUILD_PANEL_WIDTH);
-  let mut lines = compact_build_panel_lines(state, panel_width);
-  if !cache.is_empty() {
-    lines.extend(cache_panel_lines(state, width));
-  }
+  lines.push(table_header(
+    "├",
+    &columns.build_titles,
+    &columns.build_widths,
+    "┤",
+  ));
+  let summary = &state.full_summary;
+  let total = summary
+    .planned_builds
+    .len()
+    .saturating_add(summary.running_builds.len())
+    .saturating_add(summary.completed_builds.len())
+    .saturating_add(summary.failed_builds.len());
+  lines.push(table_row(
+    &[
+      format!("{total} builds"),
+      summary.running_builds.len().to_string(),
+      summary.planned_builds.len().to_string(),
+      summary.completed_builds.len().to_string(),
+      summary.failed_builds.len().to_string(),
+    ],
+    &columns.build_widths,
+    &[
+      TEXT_PRIMARY,
+      MOSS_GREEN,
+      MUTED_YELLOW,
+      BUILT_GREEN,
+      MUTED_RED,
+    ],
+  ));
+  lines.push(table_bottom(
+    width,
+    &format_duration(current_time() - state.start_time),
+  ));
   lines
 }
 
-fn join_panels(left: Vec<Line>, right: Vec<Line>) -> Vec<Line> {
-  let height = left.len().max(right.len());
-  (0..height)
-    .map(|index| {
-      let mut spans = left
-        .get(index)
-        .cloned()
-        .unwrap_or_else(|| Line::from(" ".repeat(BUILD_PANEL_WIDTH)))
-        .spans;
-      spans.push(Span::raw(" ".repeat(PANEL_GAP)));
-      if let Some(line) = right.get(index) {
-        spans.extend(line.spans.clone());
-      }
-      Line::from(spans)
-    })
-    .collect()
+#[derive(Clone, Debug)]
+struct FooterColumns {
+  host_title:   &'static str,
+  pull_title:   &'static str,
+  push_title:   &'static str,
+  build_titles: [&'static str; 5],
+  host_widths:  Vec<usize>,
+  build_widths: Vec<usize>,
+  detail:       bool,
 }
 
-fn compact_build_status(state: &RenderSnapshot) -> Line {
-  let summary = &state.full_summary;
-  let elapsed = format_duration(current_time() - state.start_time);
-  Line::from(vec![
-    Span::styled(
-      format!("{} building", summary.running_builds.len()),
-      Style::default().fg(MOSS_GREEN),
-    ),
-    Span::styled(
-      format!("  {} waiting", summary.planned_builds.len()),
-      Style::default().fg(MUTED_YELLOW),
-    ),
-    Span::styled(
-      format!("  {} built", summary.completed_builds.len()),
-      Style::default().fg(BUILT_GREEN),
-    ),
-    Span::styled(
-      format!("  {} failed", summary.failed_builds.len()),
-      Style::default().fg(MUTED_RED),
-    ),
-    Span::styled(format!("  {elapsed}"), secondary_style()),
-  ])
+impl FooterColumns {
+  fn for_width(width: usize) -> Self {
+    let (host_title, pull_title, push_title, build_titles, detail) =
+      if width >= 72 {
+        (
+          "HOSTS",
+          "PULL",
+          "PUSH",
+          ["BUILDS", "RUNNING", "WAITING", "DONE", "FAILED"],
+          true,
+        )
+      } else if width >= 44 {
+        (
+          "HOST",
+          "PULL",
+          "PUSH",
+          ["BUILDS", "RUN", "WAIT", "DONE", "FAIL"],
+          false,
+        )
+      } else {
+        (
+          "H",
+          "PULL",
+          "PUSH",
+          ["B", "RUN", "WAIT", "DONE", "FAIL"],
+          false,
+        )
+      };
+    Self {
+      host_title,
+      pull_title,
+      push_title,
+      build_titles,
+      host_widths: distribute_columns(width.saturating_sub(7), 3, &[2, 1, 1]),
+      build_widths: distribute_columns(width.saturating_sub(11), 5, &[
+        2, 1, 1, 1, 1,
+      ]),
+      detail,
+    }
+  }
 }
 
-fn compact_build_panel_lines(
-  state: &RenderSnapshot,
-  width: usize,
-) -> Vec<Line> {
+fn distribute_columns(
+  available: usize,
+  count: usize,
+  weights: &[usize],
+) -> Vec<usize> {
+  let minimum = usize::from(available >= count);
+  let mut widths = vec![minimum; count];
+  let remaining = available.saturating_sub(minimum.saturating_mul(count));
+  let weight_total = weights.iter().sum::<usize>().max(1);
+  for index in 0..remaining {
+    let point = index % weight_total;
+    let mut accumulated = 0;
+    let column = weights
+      .iter()
+      .position(|weight| {
+        accumulated += *weight;
+        point < accumulated
+      })
+      .unwrap_or(count - 1);
+    widths[column] += 1;
+  }
+  widths
+}
+
+fn compact_footer_line(state: &RenderSnapshot, width: usize) -> Line {
   let summary = &state.full_summary;
+  let total = summary
+    .planned_builds
+    .len()
+    .saturating_add(summary.running_builds.len())
+    .saturating_add(summary.completed_builds.len())
+    .saturating_add(summary.failed_builds.len());
   let elapsed = format_duration(current_time() - state.start_time);
-  let content = format!(
-    "Building {} · Waiting {} · Built {} · Failed {} · Elapsed {elapsed}",
+  let status = format!(
+    "{total} builds · {}/{}/{}/{}",
     summary.running_builds.len(),
     summary.planned_builds.len(),
     summary.completed_builds.len(),
     summary.failed_builds.len(),
   );
-  vec![
-    build_panel_border(state, width, 3, 0),
-    build_panel_content(state, width, 3, 1, &content, TEXT_PRIMARY),
-    build_panel_border(state, width, 3, 2),
-  ]
+  let notch = format!("┤ {elapsed} ┘");
+  let content_width = width.saturating_sub(2 + display_width(&notch));
+  let content = fit_text(&status, content_width);
+  let rule = "─".repeat(content_width.saturating_sub(display_width(&content)));
+  Line::from(vec![
+    Span::styled("└─", hierarchy_style()),
+    Span::styled(content, Style::default().fg(TEXT_PRIMARY)),
+    Span::styled(rule, hierarchy_style()),
+    Span::styled(notch, hierarchy_style()),
+  ])
 }
 
-fn build_panel_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
-  let width = width.max(BUILD_PANEL_WIDTH);
-  let summary = &state.full_summary;
-  let completed = summary.completed_builds.len();
-  let failed = summary.failed_builds.len();
-  let finished = completed.saturating_add(failed);
-  let total = finished
-    .saturating_add(summary.running_builds.len())
-    .saturating_add(summary.planned_builds.len());
-  let percent = finished.saturating_mul(100).checked_div(total).unwrap_or(0);
-  let title = format!("BUILD {finished}/{total} · {percent}%");
-  let rows = [
-    (title, TEXT_PRIMARY),
-    (
-      format!("{:>3}  BUILDING", summary.running_builds.len()),
-      MOSS_GREEN,
-    ),
-    (
-      format!("{:>3}  WAITING", summary.planned_builds.len()),
-      MUTED_YELLOW,
-    ),
-    (format!("{:>3}  BUILT", completed), BUILT_GREEN),
-    (format!("{:>3}  FAILED", failed), MUTED_RED),
-    (
-      format!(
-        "{} ELAPSED",
-        format_duration(current_time() - state.start_time)
-      ),
-      TEXT_MUTED,
-    ),
-  ];
-  let mut lines = Vec::with_capacity(BUILD_PANEL_HEIGHT);
-  lines.push(build_panel_border(state, width, BUILD_PANEL_HEIGHT, 0));
-  for (index, (content, color)) in rows.into_iter().enumerate() {
-    lines.push(build_panel_content(
-      state,
-      width,
-      BUILD_PANEL_HEIGHT,
-      index + 1,
-      &content,
-      color,
-    ));
-  }
-  lines.push(build_panel_border(
-    state,
-    width,
-    BUILD_PANEL_HEIGHT,
-    BUILD_PANEL_HEIGHT - 1,
-  ));
-  lines
-}
-
-fn build_panel_content(
-  state: &RenderSnapshot,
-  width: usize,
-  height: usize,
-  y: usize,
-  content: &str,
-  color: Color,
+fn table_header(
+  left: &str,
+  titles: &[&str],
+  widths: &[usize],
+  right: &str,
 ) -> Line {
-  let inner = width.saturating_sub(2);
-  let content = truncate_end_chars(content, inner);
-  let mut spans = vec![build_border_span(state, width, height, y, 0)];
-  spans.push(Span::styled(
-    format!("{content:<inner$}"),
-    Style::default().fg(color),
-  ));
-  spans.push(build_border_span(state, width, height, y, width - 1));
-  Line::from(spans)
-}
-
-fn build_panel_border(
-  state: &RenderSnapshot,
-  width: usize,
-  height: usize,
-  y: usize,
-) -> Line {
-  Line::from(
-    (0..width)
-      .map(|x| build_border_span(state, width, height, y, x))
-      .collect::<Vec<_>>(),
-  )
-}
-
-fn build_border_span(
-  state: &RenderSnapshot,
-  width: usize,
-  height: usize,
-  y: usize,
-  x: usize,
-) -> Span {
-  let (position, light, heavy, frontier) = border_position(width, height, x, y);
-  let perimeter = width
-    .saturating_mul(2)
-    .saturating_add(height * 2)
-    .saturating_sub(4);
-  let summary = &state.full_summary;
-  let built = summary.completed_builds.len();
-  let failed = summary.failed_builds.len();
-  let finished = built.saturating_add(failed);
-  let total = finished
-    .saturating_add(summary.running_builds.len())
-    .saturating_add(summary.planned_builds.len());
-  let filled = perimeter
-    .saturating_mul(finished)
-    .checked_div(total)
-    .unwrap_or(0);
-  let failed_cells = if failed == 0 {
-    0
-  } else {
-    perimeter
-      .saturating_mul(failed)
-      .checked_div(total)
-      .unwrap_or(0)
-      .max(1)
-      .min(filled)
-  };
-
-  if position < filled {
-    let color =
-      if failed_cells > 0 && position >= filled.saturating_sub(failed_cells) {
-        MUTED_RED
-      } else {
-        progress_gradient(position, perimeter)
-      };
-    Span::styled(heavy, Style::default().fg(color))
-  } else if position == filled && filled < perimeter && finished > 0 {
-    Span::styled(
-      frontier,
+  let mut spans = vec![Span::styled(left, hierarchy_style())];
+  for (index, (title, width)) in titles.iter().zip(widths).enumerate() {
+    let label = fit_text(&format!(" {title} "), *width);
+    spans.push(Span::styled("─", hierarchy_style()));
+    spans.push(Span::styled(
+      label.clone(),
       Style::default()
         .fg(TEXT_PRIMARY)
         .add_attribute(Attribute::Bold),
-    )
+    ));
+    spans.push(Span::styled(
+      "─".repeat(width.saturating_sub(display_width(&label))),
+      hierarchy_style(),
+    ));
+    spans.push(Span::styled(
+      if index + 1 == titles.len() {
+        right
+      } else {
+        "┬"
+      },
+      hierarchy_style(),
+    ));
+  }
+  Line::from(spans)
+}
+
+fn table_row(values: &[String], widths: &[usize], colors: &[Color]) -> Line {
+  let mut spans = vec![Span::styled("│", hierarchy_style())];
+  for ((value, width), color) in values.iter().zip(widths).zip(colors) {
+    let value = fit_text(value, *width);
+    let padding = width.saturating_sub(display_width(&value));
+    spans.push(Span::styled(" ", hierarchy_style()));
+    spans.push(Span::styled(value, Style::default().fg(*color)));
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled("│", hierarchy_style()));
+  }
+  Line::from(spans)
+}
+
+fn table_bottom(width: usize, elapsed: &str) -> Line {
+  let notch = format!("┤ {elapsed} ┘");
+  let rules = width.saturating_sub(1 + display_width(&notch));
+  Line::from(vec![
+    Span::styled("└", hierarchy_style()),
+    Span::styled("─".repeat(rules), hierarchy_style()),
+    Span::styled(notch, hierarchy_style()),
+  ])
+}
+
+fn transfer_cell(activity: &CacheActivity, detail: bool) -> String {
+  let paths = activity.active.saturating_add(activity.completed);
+  let path_progress = format!("{}/{}", activity.completed, paths);
+  let prefix = if detail {
+    format!("{paths} paths · {path_progress}")
   } else {
-    Span::styled(light, hierarchy_style())
-  }
-}
-
-fn border_position(
-  width: usize,
-  height: usize,
-  x: usize,
-  y: usize,
-) -> (usize, &'static str, &'static str, &'static str) {
-  if y == 0 {
-    let glyphs = if x == 0 {
-      ("┌", "┏", "┏")
-    } else if x + 1 == width {
-      ("┐", "┓", "┓")
+    format!("{paths} · {path_progress}")
+  };
+  if !activity.has_unknown_size && activity.bytes_total > 0 {
+    let percent = activity
+      .bytes_done
+      .saturating_mul(100)
+      .checked_div(activity.bytes_total)
+      .unwrap_or(0);
+    if detail {
+      format!(
+        "{prefix} · {percent}% {}/{}",
+        format_bytes(activity.bytes_done),
+        format_bytes(activity.bytes_total)
+      )
     } else {
-      ("─", "━", "╸")
-    };
-    return (x, glyphs.0, glyphs.1, glyphs.2);
-  }
-  if x + 1 == width {
-    let position = width - 1 + y;
-    let glyphs = if y + 1 == height {
-      ("┘", "┛", "┛")
-    } else {
-      ("│", "┃", "╵")
-    };
-    return (position, glyphs.0, glyphs.1, glyphs.2);
-  }
-  if y + 1 == height {
-    let position = width + height - 2 + (width - 1 - x);
-    let glyphs = if x == 0 {
-      ("└", "┗", "┗")
-    } else {
-      ("─", "━", "╺")
-    };
-    return (position, glyphs.0, glyphs.1, glyphs.2);
-  }
-  let position = 2 * width + height - 3 + (height - 1 - y);
-  (position, "│", "┃", "╷")
-}
-
-fn progress_gradient(position: usize, perimeter: usize) -> Color {
-  let denominator = perimeter.saturating_sub(1).max(1);
-  let interpolate = |start: u8, end: u8| {
-    let start = usize::from(start);
-    let end = usize::from(end);
-    if end >= start {
-      u8::try_from(start + (end - start) * position / denominator)
-        .unwrap_or(end as u8)
-    } else {
-      u8::try_from(start - (start - end) * position / denominator)
-        .unwrap_or(end as u8)
+      format!("{prefix} · {percent}%")
     }
-  };
-  let Color::Rgb {
-    r: sr,
-    g: sg,
-    b: sb,
-  } = PROGRESS_START
-  else {
-    return MOSS_GREEN;
-  };
-  let Color::Rgb {
-    r: er,
-    g: eg,
-    b: eb,
-  } = MOSS_GREEN
-  else {
-    return MOSS_GREEN;
-  };
-  Color::Rgb {
-    r: interpolate(sr, er),
-    g: interpolate(sg, eg),
-    b: interpolate(sb, eb),
-  }
-}
-
-fn cache_panel_lines(
-  state: &RenderSnapshot,
-  available_width: usize,
-) -> Vec<Line> {
-  let (from, to) = cache_activity(state);
-  if from.is_empty() && to.is_empty() {
-    return Vec::new();
-  }
-  let width = available_width.clamp(48, 64);
-  let paths_width = 9;
-  let progress_width = 20;
-  let cache_width = width.saturating_sub(paths_width + progress_width + 4);
-  let mut lines = Vec::new();
-  let first_label = if from.is_empty() { "TO" } else { "FROM" };
-  let first_color = if from.is_empty() {
-    UPLOAD_PURPLE
+  } else if detail && activity.bytes_done > 0 {
+    format!("{prefix} · {}", format_bytes(activity.bytes_done))
   } else {
-    DOWNLOAD_BLUE
-  };
-  lines.push(cache_header_line(
-    first_label,
-    first_color,
-    cache_width,
-    paths_width,
-    progress_width,
-    true,
-  ));
-  if !from.is_empty() {
-    lines.extend(cache_rows(&from, cache_width, paths_width, progress_width));
+    prefix
   }
-  if !to.is_empty() {
-    if !from.is_empty() {
-      lines.push(cache_header_line(
-        "TO",
-        UPLOAD_PURPLE,
-        cache_width,
-        paths_width,
-        progress_width,
-        false,
-      ));
+}
+
+fn display_width(value: &str) -> usize {
+  UnicodeWidthStr::width(value)
+}
+
+fn fit_text(value: &str, max_width: usize) -> String {
+  if display_width(value) <= max_width {
+    return value.to_string();
+  }
+  if max_width == 0 {
+    return String::new();
+  }
+  if max_width == 1 {
+    return "…".to_string();
+  }
+  let mut output = String::new();
+  for ch in value.chars() {
+    if display_width(&output).saturating_add(ch.width().unwrap_or(0))
+      >= max_width
+    {
+      break;
     }
-    lines.extend(cache_rows(&to, cache_width, paths_width, progress_width));
+    output.push(ch);
   }
-  lines.push(cache_bottom_line(cache_width, paths_width, progress_width));
-  lines
+  output.push('…');
+  output
 }
 
 fn cache_activity(
@@ -650,135 +600,6 @@ fn add_completed_cache(
   cache.bytes_total = cache.bytes_total.saturating_add(bytes);
 }
 
-fn cache_header_line(
-  label: &str,
-  label_color: Color,
-  cache_width: usize,
-  paths_width: usize,
-  progress_width: usize,
-  top: bool,
-) -> Line {
-  let left = if top { "┌" } else { "├" };
-  let joint = if top { "┬" } else { "┼" };
-  let right = if top { "┐" } else { "┤" };
-  let label_width = label.chars().count();
-  let mut spans = vec![Span::styled(left, hierarchy_style())];
-  spans.push(Span::styled("─ ", hierarchy_style()));
-  spans.push(Span::styled(
-    label,
-    Style::default()
-      .fg(label_color)
-      .add_attribute(Attribute::Bold),
-  ));
-  spans.push(Span::styled(
-    format!(
-      " {}",
-      "─".repeat(cache_width.saturating_sub(label_width + 3))
-    ),
-    hierarchy_style(),
-  ));
-  spans.push(Span::styled(joint, hierarchy_style()));
-  let paths_label = if top { " PATHS " } else { "" };
-  spans.push(Span::styled(
-    centered_rule(paths_label, paths_width),
-    hierarchy_style(),
-  ));
-  spans.push(Span::styled(joint, hierarchy_style()));
-  let progress_label = if top { " PROGRESS " } else { "" };
-  spans.push(Span::styled(
-    centered_rule(progress_label, progress_width),
-    hierarchy_style(),
-  ));
-  spans.push(Span::styled(right, hierarchy_style()));
-  Line::from(spans)
-}
-
-fn cache_rows(
-  caches: &BTreeMap<String, CacheActivity>,
-  cache_width: usize,
-  paths_width: usize,
-  progress_width: usize,
-) -> Vec<Line> {
-  caches
-    .iter()
-    .map(|(host, activity)| {
-      let host = truncate_end_chars(host, cache_width.saturating_sub(2));
-      let total_paths = activity.active.saturating_add(activity.completed);
-      let paths = truncate_start_chars(
-        &format!("{} / {total_paths}", activity.completed),
-        paths_width,
-      );
-      let progress = truncate_end_chars(
-        &cache_progress(activity),
-        progress_width.saturating_sub(2),
-      );
-      Line::from(vec![
-        Span::styled("│", hierarchy_style()),
-        Span::styled(
-          format!(" {host:<width$}", width = cache_width - 1),
-          Style::default().fg(TEXT_PRIMARY),
-        ),
-        Span::styled("│", hierarchy_style()),
-        Span::styled(
-          format!("{paths:>width$}", width = paths_width),
-          secondary_style(),
-        ),
-        Span::styled("│", hierarchy_style()),
-        Span::styled(
-          format!(" {progress:<width$}", width = progress_width - 1),
-          secondary_style(),
-        ),
-        Span::styled("│", hierarchy_style()),
-      ])
-    })
-    .collect()
-}
-
-fn cache_progress(activity: &CacheActivity) -> String {
-  if !activity.has_unknown_size && activity.bytes_total > 0 {
-    let percent = activity
-      .bytes_done
-      .saturating_mul(100)
-      .checked_div(activity.bytes_total)
-      .unwrap_or(0);
-    format!(
-      "{percent}% · {}/{}",
-      format_bytes(activity.bytes_done),
-      format_bytes(activity.bytes_total)
-    )
-  } else if activity.bytes_done > 0 {
-    format_bytes(activity.bytes_done)
-  } else {
-    "—".to_string()
-  }
-}
-
-fn cache_bottom_line(
-  cache_width: usize,
-  paths_width: usize,
-  progress_width: usize,
-) -> Line {
-  Line::from(Span::styled(
-    format!(
-      "└{}┴{}┴{}┘",
-      "─".repeat(cache_width),
-      "─".repeat(paths_width),
-      "─".repeat(progress_width)
-    ),
-    hierarchy_style(),
-  ))
-}
-
-fn centered_rule(label: &str, width: usize) -> String {
-  if label.is_empty() {
-    return "─".repeat(width);
-  }
-  let label_width = label.chars().count().min(width);
-  let left = width.saturating_sub(label_width) / 2;
-  let right = width.saturating_sub(label_width + left);
-  format!("{}{}{}", "─".repeat(left), label, "─".repeat(right))
-}
-
 fn format_bytes(bytes: u64) -> String {
   const KIB: f64 = 1024.0;
   const MIB: f64 = KIB * 1024.0;
@@ -793,35 +614,6 @@ fn format_bytes(bytes: u64) -> String {
   } else {
     format!("{bytes:.0}B")
   }
-}
-
-fn truncate_start_chars(value: &str, max_chars: usize) -> String {
-  let length = value.chars().count();
-  if length <= max_chars {
-    return value.to_string();
-  }
-  if max_chars <= 1 {
-    return "…".to_string();
-  }
-  format!(
-    "…{}",
-    value
-      .chars()
-      .skip(length - (max_chars - 1))
-      .collect::<String>()
-  )
-}
-
-fn truncate_end_chars(value: &str, max_chars: usize) -> String {
-  if value.chars().count() <= max_chars {
-    return value.to_string();
-  }
-  if max_chars <= 1 {
-    return "…".to_string();
-  }
-  let mut result = value.chars().take(max_chars - 1).collect::<String>();
-  result.push('…');
-  result
 }
 
 fn cache_host_label(host: &cognos::Host) -> Option<String> {

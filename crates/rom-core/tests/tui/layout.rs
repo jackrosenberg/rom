@@ -7,24 +7,62 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
     render_graph_screen(80, 8, &state.render_snapshot(), &tui_config());
 
   let first_activity = screen.row_text(0).unwrap();
-  let progress_border = screen.row_text(1).unwrap();
-  let status = screen.row_text(2).unwrap();
-  let bottom_border = screen.row_text(3).unwrap();
+  let hosts_header = screen.row_text(1).unwrap();
+  let empty_host = screen.row_text(2).unwrap();
+  let builds_header = screen.row_text(3).unwrap();
+  let status = screen.row_text(4).unwrap();
+  let bottom_border = screen.row_text(5).unwrap();
   assert!(
     first_activity.contains("hello-1.0"),
     "graph should begin without a redundant title: {first_activity:?}"
   );
-  assert!(progress_border.starts_with('┌'), "{progress_border:?}");
-  assert!(
-    status.contains("Building 1"),
-    "unexpected status: {status:?}"
-  );
+  assert!(first_activity.starts_with("├─ "), "{first_activity:?}");
+  assert!(hosts_header.starts_with("├─ HOSTS "), "{hosts_header:?}");
+  assert!(empty_host.starts_with("│ —"), "{empty_host:?}");
+  assert!(builds_header.starts_with("├─ BUILDS "), "{builds_header:?}");
+  assert!(status.contains("1 builds"), "unexpected status: {status:?}");
+  assert!(status.contains("│ 1"), "running count missing: {status:?}");
   assert!(bottom_border.starts_with('└'), "{bottom_border:?}");
-  assert_eq!(
-    screen.height(),
-    4,
-    "compact live region should not retain blank rows"
+  assert!(bottom_border.contains("┤ ") && bottom_border.ends_with(" ┘"));
+  assert_eq!(screen.height(), 6);
+}
+
+#[test]
+fn narrow_footer_stays_a_connected_thin_table() {
+  let state = running_state();
+  let screen =
+    render_graph_screen(32, 8, &state.render_snapshot(), &tui_config());
+  let rendered = screen.plain_text();
+  assert!(rendered.contains("├─ H "), "{rendered}");
+  assert!(rendered.contains("├─ B "), "{rendered}");
+  assert!(
+    rendered.contains("┤ ") && rendered.contains(" ┘"),
+    "{rendered}"
   );
+  assert!(
+    !rendered.contains('┏') && !rendered.contains('━'),
+    "{rendered}"
+  );
+  for row in 0..screen.height() {
+    assert!(screen.row_text(row).is_some(), "missing row {row}");
+  }
+}
+
+#[test]
+fn final_and_live_renderers_share_the_connected_footer() {
+  let state = running_state();
+  let snapshot = state.render_snapshot();
+  let live = render_graph_screen(100, 12, &snapshot, &tui_config());
+  let final_screen = render_final_graph_screen(100, &state, &tui_config());
+  for needle in ["├─ HOSTS ", "│ —", "├─ BUILDS ", "│ 1 builds", "┤"]
+  {
+    assert!(live.plain_text().contains(needle), "{}", live.plain_text());
+    assert!(
+      final_screen.plain_text().contains(needle),
+      "{}",
+      final_screen.plain_text()
+    );
+  }
 }
 
 #[test]
@@ -58,11 +96,13 @@ fn live_graph_footer_reports_multiple_roots() {
 
   let screen =
     render_graph_screen(80, 8, &state.render_snapshot(), &tui_config());
-  assert!(
-    screen.plain_text().contains("Waiting 2"),
-    "missing build context: {}",
-    screen.plain_text()
-  );
+  let rendered = screen.plain_text();
+  let rows = rendered.lines().collect::<Vec<_>>();
+  assert!(rows[1].starts_with("├─ first-1.0"), "{rendered}");
+  assert!(rows[2].starts_with("├─ HOSTS "), "{rendered}");
+  assert!(rendered.contains("│ 2 builds"), "{rendered}");
+  let values = rows.iter().find(|row| row.contains("2 builds")).unwrap();
+  assert!(values.split('│').any(|cell| cell.trim() == "2"), "{values}");
 }
 
 #[test]
@@ -238,8 +278,8 @@ fn tui_renders_running_build_as_devenv_style_activity() {
 
   let rendered = format!("{}", terminal.backend());
   assert!(
-    rendered.contains("Building 1"),
-    "build panel should report active work: {rendered}"
+    rendered.contains("1 builds") && rendered.contains("RUNNING"),
+    "build table should report active work: {rendered}"
   );
   assert!(
     !rendered.contains("❧"),
@@ -252,7 +292,7 @@ fn tui_renders_running_build_as_devenv_style_activity() {
   assert!(
     !rendered.contains("╭")
       && !rendered.contains("╰")
-      && !rendered.contains("┤"),
+      && !rendered.contains("╯"),
     "old leaf box glyphs should not remain: {rendered}"
   );
   assert!(
@@ -285,7 +325,8 @@ fn final_failure_uses_the_live_console_graph_renderer() {
   let screen = render_final_graph_screen(100, &state, &tui_config());
   let rendered = screen.plain_text();
   assert!(rendered.contains("hello-1.0"), "{rendered}");
-  assert!(rendered.contains("Failed 1"), "{rendered}");
+  assert!(rendered.contains("FAILED"), "{rendered}");
+  assert!(rendered.contains("│ 1              │"), "{rendered}");
   assert!(!rendered.contains("Dependency Graph"), "{rendered}");
 }
 
@@ -454,8 +495,8 @@ fn tui_keeps_root_visible_when_activity_graph_overflows() {
   let snapshot = state.render_snapshot();
   assert_eq!(
     rom_core::tui::minimum_required_graph_rows_at_width(100, &snapshot),
-    12,
-    "eight running dependencies, their unknown root, and console footer are \
+    14,
+    "eight running dependencies, their unknown root, and connected table are \
      required"
   );
 
@@ -600,8 +641,8 @@ fn tui_uses_thin_connectors_for_dependency_siblings() {
     "bottom dependency should keep the branch open for the root: {first_row:?}"
   );
   assert!(
-    root_row.starts_with("root-1.0"),
-    "NOM-style root should remain undecorated: {root_row:?}"
+    root_row.starts_with("├─ root-1.0"),
+    "final root should continue into the footer rail: {root_row:?}"
   );
 }
 
@@ -664,8 +705,8 @@ fn tui_joins_visible_dependency_branch_into_parent() {
     "NOM-style parent row should close its dependency rail: {parent_row:?}"
   );
   assert!(
-    root_row.starts_with("root-1.0"),
-    "NOM-style top-level root should not carry a connector: {root_row:?}"
+    root_row.starts_with("├─ root-1.0"),
+    "top-level root should continue into the footer rail: {root_row:?}"
   );
 }
 

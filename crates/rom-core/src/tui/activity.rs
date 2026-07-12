@@ -822,6 +822,9 @@ fn flatten_activity_forest(
 ) -> Vec<RenderedActivityLine> {
   let mut lines = flatten_activity_forest_preorder(forest, false);
   lines.reverse();
+  if let Some(final_root) = lines.last_mut() {
+    *final_root = final_root.clone().with_prefix("├─ ");
+  }
   lines
 }
 
@@ -962,7 +965,7 @@ mod tests {
       "┌─ sibling",
       "│  ┌─ nested",
       "├─ parent",
-      "root",
+      "├─ root",
     ]);
   }
 }

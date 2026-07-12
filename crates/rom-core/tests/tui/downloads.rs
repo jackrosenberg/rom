@@ -46,13 +46,86 @@ fn tui_renders_running_uploads_as_first_class_graph_activity() {
     row_containing(&terminal, "cache.example.org").expect("cache row"),
   );
   assert!(
-    cache_row.find("BUILD").is_some_and(|build| {
-      cache_row
-        .find("cache.example.org")
-        .is_some_and(|cache| build < cache)
-    }),
-    "build sidecar should remain left of cache activity: {cache_row:?}"
+    cache_row.starts_with("│ cache.example.org"),
+    "{cache_row:?}"
   );
+  let push_header = row_text(
+    &terminal,
+    row_containing(&terminal, "PUSH").expect("host header"),
+  );
+  let push_column = push_header
+    .chars()
+    .position(|character| character == 'P')
+    .expect("push column");
+  assert!(
+    cache_row
+      .chars()
+      .skip(push_column)
+      .collect::<String>()
+      .contains("1 paths · 0/1"),
+    "upload belongs in the PUSH cell: {cache_row:?}"
+  );
+}
+
+#[test]
+fn connected_footer_merges_pull_and_push_for_the_same_host() {
+  let mut state = running_state();
+  let drv_id = state.forest_roots[0];
+  let pull_path = add_output_path(&mut state, drv_id, "pull-output");
+  let push_path = add_store_path(&mut state, "push-output");
+  let host = cognos::Host::Remote("ssh://user@cache.example.org".to_string());
+  for (path, uploads) in [(pull_path, false), (push_path, true)] {
+    let transfer = TransferInfo {
+      start:             current_time() - 1.0,
+      host:              host.clone(),
+      activity_id:       path as u64,
+      bytes_transferred: 512,
+      total_bytes:       Some(1_024),
+    };
+    if uploads {
+      state.full_summary.running_uploads.insert(path, transfer);
+    } else {
+      state.full_summary.running_downloads.insert(path, transfer);
+    }
+  }
+
+  let screen =
+    render_graph_screen(100, 12, &state.render_snapshot(), &tui_config());
+  let rendered = screen.plain_text();
+  assert_eq!(
+    rendered.matches("cache.example.org").count(),
+    1,
+    "{rendered}"
+  );
+  let row = (0..screen.height())
+    .filter_map(|index| screen.row_text(index))
+    .find(|row| row.contains("cache.example.org"))
+    .expect("combined host row");
+  assert_eq!(row.matches("1 paths · 0/1").count(), 2, "{row}");
+}
+
+#[test]
+fn connected_footer_lists_distinct_remote_hosts_once_each() {
+  let mut state = running_state();
+  for (index, host) in ["one.example", "two.example"].into_iter().enumerate() {
+    let path = add_store_path(&mut state, &format!("remote-{index}"));
+    state
+      .full_summary
+      .running_downloads
+      .insert(path, TransferInfo {
+        start:             current_time(),
+        host:              cognos::Host::Remote(format!("https://{host}")),
+        activity_id:       index as u64,
+        bytes_transferred: 0,
+        total_bytes:       None,
+      });
+  }
+  let rendered =
+    render_graph_screen(80, 12, &state.render_snapshot(), &tui_config())
+      .plain_text();
+  for host in ["one.example", "two.example"] {
+    assert_eq!(rendered.matches(host).count(), 1, "{rendered}");
+  }
 }
 
 #[test]
@@ -80,7 +153,7 @@ fn cache_sidecar_retains_completed_cache_activity() {
 
   let rendered = format!("{}", terminal.backend());
   assert!(rendered.contains("cache.nixos.org"), "{rendered}");
-  assert!(rendered.contains("1 / 1"), "{rendered}");
+  assert!(rendered.contains("1 paths · 1/1"), "{rendered}");
   assert!(rendered.contains("100%"), "{rendered}");
 }
 
@@ -273,7 +346,7 @@ fn tui_renders_running_downloads_inline_in_dependency_graph() {
     "running substitute should show transfer progress: {download_row:?}"
   );
   assert!(
-    rendered.contains("0 / 1"),
+    rendered.contains("1 paths · 0/1"),
     "download should still be counted in the cache table: {rendered}"
   );
   assert!(

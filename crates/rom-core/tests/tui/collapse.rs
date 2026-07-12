@@ -157,8 +157,8 @@ fn tui_limits_large_planned_root_sets() {
     "large root sets should not render every planned root: {rendered}"
   );
   assert!(
-    rendered.contains("Waiting 100"),
-    "build panel should report the waiting root count: {rendered}"
+    rendered.contains("100 builds") && rendered.contains("│ 100         │"),
+    "build table should report the waiting root count: {rendered}"
   );
 }
 
@@ -373,9 +373,8 @@ fn tui_completed_builds_render_only_when_capacity_and_relevance_allow() {
 
   let rendered = format!("{}", terminal.backend());
   assert!(
-    !rendered.contains("old-done-1.0"),
-    "old completed builds should lose limited capacity to running builds: \
-     {rendered}"
+    rendered.contains("old-done-1.0"),
+    "the one-row footer fallback should leave spare graph capacity: {rendered}"
   );
 }
 
@@ -430,7 +429,7 @@ fn tui_color_codes_activity_statuses() {
     buffer[(0, waiting_row)].style.foreground,
     Some(MUTED_YELLOW)
   );
-  assert_eq!(buffer[(0, failed_row)].style.foreground, Some(MUTED_RED));
+  assert_eq!(buffer[(3, failed_row)].style.foreground, Some(MUTED_RED));
 }
 
 #[test]
