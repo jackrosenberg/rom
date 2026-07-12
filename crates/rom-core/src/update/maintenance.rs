@@ -2,7 +2,6 @@ use crate::state::{
   BuildStatus,
   CompletedTransferInfo,
   DerivationId,
-  InputDerivation,
   State,
   StorePathId,
   current_time,
@@ -111,18 +110,6 @@ pub(crate) fn sort_key(state: &State, drv_id: DerivationId) -> BuildSortKey {
   (own_a, own_b, sub_a, sub_b, drv_id)
 }
 
-fn sort_tree_children(state: &mut State, drv_id: DerivationId) {
-  let Some(info) = state.derivation_infos.get(&drv_id) else {
-    return;
-  };
-  let mut inputs: Vec<InputDerivation> = info.input_derivations.clone();
-  inputs.sort_by_key(|input| sort_key(state, input.derivation));
-
-  if let Some(info) = state.derivation_infos.get_mut(&drv_id) {
-    info.input_derivations = inputs;
-  }
-}
-
 pub fn detect_local_completed_builds(state: &mut State, now: f64) -> bool {
   let local_building: Vec<DerivationId> = state
     .full_summary
@@ -172,23 +159,6 @@ pub fn detect_local_completed_builds(state: &mut State, now: f64) -> bool {
   }
 
   any_completed
-}
-
-pub fn maintain_state(state: &mut State, _now: f64) {
-  if state.touched_ids.is_empty() {
-    return;
-  }
-
-  let touched: Vec<DerivationId> = state.touched_ids.iter().copied().collect();
-  for drv_id in touched {
-    sort_tree_children(state, drv_id);
-  }
-
-  let mut sorted_roots = state.forest_roots.clone();
-  sorted_roots.sort_by_key(|id| sort_key(state, *id));
-  state.forest_roots = sorted_roots;
-
-  state.touched_ids.clear();
 }
 
 fn complete_build_success(state: &mut State, drv_id: DerivationId, now: f64) {

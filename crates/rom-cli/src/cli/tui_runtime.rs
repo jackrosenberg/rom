@@ -356,10 +356,7 @@ fn cancel_child(
 fn populate_pending_dependencies(shared: &MonitorShared) {
   let mut state = shared.state.lock().unwrap();
   let mut graph = shared.graph.lock().unwrap();
-  if graph.populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME) {
-    let now = rom_core::state::current_time();
-    rom_core::update::maintain_state(&mut state, now);
-  }
+  graph.populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME);
 }
 
 #[cfg(test)]

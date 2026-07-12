@@ -515,23 +515,13 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
           let (derivation_count_before, derivation_count_after) = {
             let mut state = state.lock().unwrap();
             let derivation_count_before = state.derivation_infos.len();
-            let mut changed =
-              rom_core::update::process_message(&mut state, action.clone());
-            changed |= {
-              let mut graph = graph.lock().unwrap();
-              let mut graph_changed = graph.observe_action(&mut state, &action);
-              if let cognos::Actions::Message { msg, raw_msg, .. } = &action {
-                graph_changed |= graph.observe_plan_line(
-                  &mut state,
-                  raw_msg.as_deref().unwrap_or(msg.as_str()),
-                );
-              }
-              graph_changed
-            };
-            if changed {
-              rom_core::update::maintain_state(
+            rom_core::update::process_message(&mut state, action.clone());
+            let mut graph = graph.lock().unwrap();
+            graph.observe_action(&mut state, &action);
+            if let cognos::Actions::Message { msg, raw_msg, .. } = &action {
+              graph.observe_plan_line(
                 &mut state,
-                rom_core::state::current_time(),
+                raw_msg.as_deref().unwrap_or(msg.as_str()),
               );
             }
             let derivation_count_after = state.derivation_infos.len();
@@ -742,12 +732,8 @@ pub(super) fn run_streaming_render_loop(
       {
         let mut state = render_state.lock().unwrap();
         let mut graph = render_graph.lock().unwrap();
-        if graph
-          .populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME)
-        {
-          let now = rom_core::state::current_time();
-          rom_core::update::maintain_state(&mut state, now);
-        }
+        graph
+          .populate_pending(&mut state, DEPENDENCY_POPULATE_BUDGET_PER_FRAME);
       }
 
       let lines = log_store.lock().unwrap().drain_pending();
@@ -797,10 +783,7 @@ fn finish_monitored_command(
 fn finish_monitor_state(shared: &MonitorShared) {
   let mut state = shared.state.lock().unwrap();
   let mut graph = shared.graph.lock().unwrap();
-  if graph.drain_pending(&mut state, Duration::from_secs(2)) {
-    let now = rom_core::state::current_time();
-    rom_core::update::maintain_state(&mut state, now);
-  }
+  graph.drain_pending(&mut state, Duration::from_secs(2));
   rom_core::update::finish_state(&mut state);
 }
 

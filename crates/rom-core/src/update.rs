@@ -3,11 +3,7 @@ mod maintenance;
 
 use cognos::{Actions, Activities, Host, Id, ResultType, Verbosity};
 pub(crate) use maintenance::{BuildSortKey, sort_key};
-pub use maintenance::{
-  detect_local_completed_builds,
-  finish_state,
-  maintain_state,
-};
+pub use maintenance::{detect_local_completed_builds, finish_state};
 use tracing::{debug, trace};
 
 use crate::state::{

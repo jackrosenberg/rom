@@ -398,7 +398,6 @@ fn apply_parsed_derivation_chunk(
     state.mark_dependencies_populated(pending.drv_id);
     state.recompute_derivation_summary(pending.drv_id);
     state.propagate_to_parents(pending.drv_id);
-    state.touched_ids.insert(pending.drv_id);
     changed = true;
   }
 

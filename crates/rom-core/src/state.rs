@@ -266,7 +266,6 @@ pub struct State {
   pub store_path_ids:    HashMap<StorePath, StorePathId>,
   pub derivation_ids:    HashMap<Derivation, DerivationId>,
   derivation_name_index: HashMap<String, HashSet<DerivationId>>,
-  pub touched_ids:       HashSet<DerivationId>,
   pub activities:        HashMap<ActivityId, ActivityStatus>,
   pub nix_errors:        Vec<String>,
   pub evaluation_state:  EvalInfo,
@@ -292,7 +291,6 @@ impl State {
       store_path_ids:        HashMap::new(),
       derivation_ids:        HashMap::new(),
       derivation_name_index: HashMap::new(),
-      touched_ids:           HashSet::new(),
       activities:            HashMap::new(),
       nix_errors:            Vec::new(),
       evaluation_state:      EvalInfo::default(),
@@ -437,7 +435,6 @@ impl State {
         std::mem::replace(&mut info.build_status, new_status.clone());
       self.full_summary.clear_derivation(id, &old_status);
       self.full_summary.update_derivation(id, &new_status);
-      self.touched_ids.insert(id);
     }
 
     self.recompute_derivation_summary(id);
@@ -538,7 +535,6 @@ impl State {
     for drv_id in derivations {
       self.recompute_derivation_summary(drv_id);
       self.propagate_to_parents(drv_id);
-      self.touched_ids.insert(drv_id);
     }
   }
 
@@ -586,7 +582,6 @@ impl State {
       ready.sort_unstable();
       for ancestor_id in ready {
         self.recompute_derivation_summary(ancestor_id);
-        self.touched_ids.insert(ancestor_id);
         pending.remove(&ancestor_id);
       }
     }
