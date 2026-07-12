@@ -23,6 +23,7 @@ fn live_graph_keeps_status_summary_directly_below_activity() {
   assert!(status.contains("1 builds"), "unexpected status: {status:?}");
   assert!(status.contains("│ 1"), "running count missing: {status:?}");
   assert!(bottom_border.starts_with('└'), "{bottom_border:?}");
+  assert!(bottom_border.contains('┴'), "{bottom_border:?}");
   assert!(bottom_border.contains("┤ ") && bottom_border.ends_with(" ┘"));
   assert_eq!(screen.height(), 6);
 }

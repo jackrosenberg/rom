@@ -313,6 +313,7 @@ fn footer_lines(state: &RenderSnapshot, width: usize) -> Vec<Line> {
   lines.push(table_bottom(
     width,
     &format_duration(current_time() - state.start_time),
+    &columns.build_widths,
   ));
   lines
 }
@@ -467,14 +468,28 @@ fn table_row(values: &[String], widths: &[usize], colors: &[Color]) -> Line {
   Line::from(spans)
 }
 
-fn table_bottom(width: usize, elapsed: &str) -> Line {
+fn table_bottom(width: usize, elapsed: &str, columns: &[usize]) -> Line {
   let notch = format!("┤ {elapsed} ┘");
-  let rules = width.saturating_sub(1 + display_width(&notch));
+  let rule_width = width.saturating_sub(1 + display_width(&notch));
+  let mut rule = String::new();
+  for (index, column_width) in columns.iter().enumerate() {
+    rule.push_str(&"─".repeat(column_width.saturating_add(1)));
+    if index + 1 < columns.len() {
+      rule.push('┴');
+    }
+  }
+  rule = fit_rule(&rule, rule_width);
   Line::from(vec![
     Span::styled("└", hierarchy_style()),
-    Span::styled("─".repeat(rules), hierarchy_style()),
+    Span::styled(rule, hierarchy_style()),
     Span::styled(notch, hierarchy_style()),
   ])
+}
+
+fn fit_rule(rule: &str, width: usize) -> String {
+  let mut fitted = rule.chars().take(width).collect::<String>();
+  fitted.push_str(&"─".repeat(width.saturating_sub(display_width(&fitted))));
+  fitted
 }
 
 fn transfer_cell(activity: &CacheActivity, detail: bool) -> String {
