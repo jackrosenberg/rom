@@ -88,12 +88,23 @@ impl Default for GraphIndexer {
 impl GraphIndexer {
   #[must_use]
   pub fn new() -> Self {
+    Self::with_parser(|path| {
+      cognos::parse_drv_file(path)
+        .map(ParsedGraph::from)
+        .map_err(|error| error.to_string())
+    })
+  }
+
+  fn with_parser<F>(parser: F) -> Self
+  where
+    F: Fn(&str) -> Result<ParsedGraph, String> + Send + 'static,
+  {
     let (request_tx, request_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
 
     thread::Builder::new()
       .name("rom-graph-indexer".to_string())
-      .spawn(move || parse_worker(request_rx, result_tx))
+      .spawn(move || parse_worker(request_rx, result_tx, parser))
       .expect("failed to spawn graph indexer");
 
     Self {
@@ -236,6 +247,13 @@ impl GraphIndexer {
         continue;
       };
       let drv_path = info.name.path.display().to_string();
+      // `Derivation` has public fields for compatibility, so callers can
+      // construct one without going through `Derivation::parse`. Revalidate at
+      // the filesystem boundary before the worker opens anything.
+      if Derivation::parse(&drv_path).is_none() {
+        debug!("refusing to index non-store derivation path: {drv_path}");
+        continue;
+      }
       self.submitted_dependency_set.insert(drv_id);
       self.in_flight_dependency_set.insert(drv_id);
       if self
@@ -317,13 +335,15 @@ impl GraphIndexer {
   }
 }
 
-fn parse_worker(
+fn parse_worker<F>(
   request_rx: mpsc::Receiver<ParseRequest>,
   result_tx: mpsc::Sender<ParseResult>,
-) {
+  parser: F,
+) where
+  F: Fn(&str) -> Result<ParsedGraph, String>,
+{
   for request in request_rx {
-    let parsed =
-      cognos::parse_drv_file(&request.drv_path).map(ParsedGraph::from);
+    let parsed = parser(&request.drv_path);
     if result_tx
       .send(ParseResult {
         drv_id: request.drv_id,
@@ -512,5 +532,65 @@ mod tests {
 
     assert_eq!(graph.pending_dependency_populates.len(), 1);
     assert_eq!(graph.pending_dependency_set.len(), 1);
+  }
+
+  #[test]
+  fn async_indexer_populates_recursively_discovered_dependencies() {
+    let root =
+      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv".to_string();
+    let leaf =
+      "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-leaf.drv".to_string();
+    let parser_root = root.clone();
+    let parser_leaf = leaf.clone();
+    let mut graph = GraphIndexer::with_parser(move |path| {
+      let input_drvs = if path == parser_root {
+        VecDeque::from([(parser_leaf.clone(), vec!["out".to_string()])])
+      } else if path == parser_leaf {
+        VecDeque::new()
+      } else {
+        return Err(format!("unexpected derivation: {path}"));
+      };
+      Ok(ParsedGraph {
+        pname: None,
+        platform: "x86_64-linux".to_string(),
+        outputs: Vec::new(),
+        input_drvs,
+        input_srcs: VecDeque::new(),
+      })
+    });
+    let mut state = State::new();
+    let root_id =
+      graph.plan_derivation(&mut state, Derivation::parse(&root).unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !state.dependencies_populated(root_id) && Instant::now() < deadline {
+      graph.populate_pending(&mut state, 64);
+      thread::sleep(Duration::from_millis(1));
+    }
+
+    let root_info = state.get_derivation_info(root_id).unwrap();
+    assert!(root_info.dependencies_populated);
+    assert_eq!(root_info.input_derivations.len(), 1);
+    let leaf_id = root_info.input_derivations[0].derivation;
+    assert_eq!(
+      state.get_derivation_info(leaf_id).unwrap().name.path,
+      std::path::PathBuf::from(leaf)
+    );
+  }
+
+  #[test]
+  fn filesystem_boundary_rejects_manually_constructed_derivation() {
+    let mut state = State::new();
+    let mut graph = GraphIndexer::new();
+    let id = graph.plan_derivation(&mut state, Derivation {
+      path: "/tmp/attacker-controlled.drv".into(),
+      name: "attacker-controlled".to_string(),
+    });
+
+    graph.populate_pending(&mut state, 1);
+
+    assert!(!state.dependencies_populated(id));
+    assert!(graph.in_flight_dependency_set.is_empty());
+    assert!(graph.submitted_dependency_set.is_empty());
   }
 }
